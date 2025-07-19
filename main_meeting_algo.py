@@ -2,6 +2,105 @@ import datetime
 import collections
 import re
 
+# Hardcoded participant preferences
+PARTICIPANT_PREFERENCES = {
+    "user1": {
+        "preferred_hours": {"start": 9, "end": 17},  # 9 AM to 5 PM
+        "max_meetings_per_day": 6,
+        "avoid_back_to_back": True,
+        "buffer_minutes": 15  # Buffer between meetings
+    },
+    "user2": {
+        "preferred_hours": {"start": 10, "end": 18},  # 10 AM to 6 PM
+        "max_meetings_per_day": 4,
+        "avoid_back_to_back": True,
+        "buffer_minutes": 30
+    },
+    "user3": {
+        "preferred_hours": {"start": 8, "end": 16},  # 8 AM to 4 PM
+        "max_meetings_per_day": 8,
+        "avoid_back_to_back": False,
+        "buffer_minutes": 0
+    }
+}
+
+def get_user_preferences(user_id):
+    """
+    Get preferences for a specific user.
+    Returns default preferences if user not found.
+    """
+    default_preferences = {
+        "preferred_hours": {"start": 9, "end": 17},
+        "max_meetings_per_day": 5,
+        "avoid_back_to_back": True,
+        "buffer_minutes": 15
+    }
+    return PARTICIPANT_PREFERENCES.get(user_id, default_preferences)
+
+def calculate_preference_score(start_time, end_time, attendees, calendars):
+    """
+    Calculate a preference score for a given time slot.
+    Lower score is better (0 = perfect, higher = more violations).
+    
+    Args:
+        start_time (datetime): Proposed meeting start time
+        end_time (datetime): Proposed meeting end time
+        attendees (list): List of attendee user IDs
+        calendars (dict): Current calendar data
+        
+    Returns:
+        int: Preference violation score (0 = no violations)
+    """
+    score = 0
+    violations = []
+    
+    for user_id in attendees:
+        preferences = get_user_preferences(user_id)
+        user_events = calendars.get(user_id, [])
+        
+        # Check preferred hours violation
+        meeting_start_hour = start_time.hour
+        meeting_end_hour = end_time.hour
+        pref_start = preferences["preferred_hours"]["start"]
+        pref_end = preferences["preferred_hours"]["end"]
+        
+        if meeting_start_hour < pref_start or meeting_end_hour > pref_end:
+            score += 50  # Heavy penalty for outside preferred hours
+            violations.append(f"{user_id}: Outside preferred hours ({pref_start}-{pref_end})")
+        
+        # Check max meetings per day
+        meeting_date = start_time.date()
+        same_day_meetings = [
+            event for event in user_events 
+            if event[0].date() == meeting_date
+        ]
+        
+        if len(same_day_meetings) >= preferences["max_meetings_per_day"]:
+            score += 30  # Penalty for exceeding daily limit
+            violations.append(f"{user_id}: Exceeds daily meeting limit ({preferences['max_meetings_per_day']})")
+        
+        # Check back-to-back meetings
+        if preferences["avoid_back_to_back"]:
+            buffer_delta = datetime.timedelta(minutes=preferences["buffer_minutes"])
+            
+            for event_start, event_end, _, _ in user_events:
+                # Check if new meeting is too close to existing meetings
+                time_diff_end = abs((event_end - start_time).total_seconds())
+                time_diff_start = abs((end_time - event_start).total_seconds())
+                
+                if (time_diff_end < buffer_delta.total_seconds() or
+                    time_diff_start < buffer_delta.total_seconds()):
+                    score += 20  # Penalty for back-to-back meetings
+                    violations.append(f"{user_id}: Back-to-back meeting (needs {preferences['buffer_minutes']}min buffer)")
+                    break
+    
+    if violations:
+        print(f"  Preference violations for slot {start_time.strftime('%H:%M')}-{end_time.strftime('%H:%M')} (score: {score}):")
+        for violation in violations:
+            print(f"    - {violation}")
+    
+    return score
+
 def requirewna(meetings_to_reschedule, new_meeting_info):
     """
     Handle necessary actions during rescheduling.
@@ -116,13 +215,13 @@ def parse_calendar_data(raw_events):
             
     return dict(parsed_calendars)
 
-def find_earliest_slot(calendars, attendees, duration_minutes, new_meeting_priority, search_start_time=None):
+def find_earliest_slot(calendars, attendees, duration_minutes, new_meeting_priority, search_start_time=None, max_preference_score=100):
     """
-    Finds the earliest possible time slot, considering meeting priorities.
+    Finds the earliest possible time slot, considering meeting priorities and participant preferences.
 
-    It first searches for a completely empty slot. If none is found, it then
-    looks for slots occupied by meetings of a lower priority that can be
-    rescheduled.
+    It first searches for a completely empty slot with acceptable preference score. If none is found, 
+    it then looks for slots occupied by meetings of a lower priority that can be rescheduled.
+    Finally, it respects working hours and preference constraints.
 
     Args:
         calendars (dict): Parsed calendar data with priorities.
@@ -130,6 +229,7 @@ def find_earliest_slot(calendars, attendees, duration_minutes, new_meeting_prior
         duration_minutes (int): The required duration of the meeting.
         new_meeting_priority (int): The priority of the meeting to be scheduled.
         search_start_time (datetime.datetime, optional): The time to start searching from.
+        max_preference_score (int): Maximum acceptable preference violation score.
 
     Returns:
         tuple or None: A tuple of ( (start_time, end_time), list_of_meetings_to_reschedule ).
@@ -157,6 +257,16 @@ def find_earliest_slot(calendars, attendees, duration_minutes, new_meeting_prior
 
     meeting_duration = datetime.timedelta(minutes=duration_minutes)
     
+    # Determine working hours constraints based on attendee preferences
+    earliest_start_hour = min(get_user_preferences(user)["preferred_hours"]["start"] for user in attendees)
+    latest_end_hour = max(get_user_preferences(user)["preferred_hours"]["end"] for user in attendees)
+    
+    # Adjust search start time to respect working hours
+    if search_start_time.hour < earliest_start_hour:
+        search_start_time = search_start_time.replace(hour=earliest_start_hour, minute=0, second=0, microsecond=0)
+    
+    print(f"  Working hours constraint: {earliest_start_hour}:00 - {latest_end_hour}:00")
+    
     # 1. Aggregate all busy slots from all attendees.
     all_busy_slots = []
     for user_id in attendees:
@@ -168,8 +278,7 @@ def find_earliest_slot(calendars, attendees, duration_minutes, new_meeting_prior
     # Sort by start time to allow chronological searching.
     all_busy_slots.sort(key=lambda x: x[0])
 
-    # 2. First pass: Find a purely free slot (no conflicts).
-    # This is the same logic as before, ignoring priority for now.
+    # 2. First pass: Find a purely free slot with acceptable preference score.
     merged_busy_slots = []
     if all_busy_slots:
         # We only care about the time intervals for this pass.
@@ -186,28 +295,52 @@ def find_earliest_slot(calendars, attendees, duration_minutes, new_meeting_prior
     # Check for a free slot before the first busy period
     search_pointer = search_start_time
     first_busy_start = merged_busy_slots[0][0] if merged_busy_slots else None
+    
+    # Check if we can fit before first meeting and within working hours
     if not first_busy_start or search_pointer + meeting_duration <= first_busy_start:
-        return ((search_pointer, search_pointer + meeting_duration), [])
+        candidate_start = search_pointer
+        candidate_end = candidate_start + meeting_duration
+        
+        # Check working hours constraint
+        if candidate_end.hour <= latest_end_hour:
+            preference_score = calculate_preference_score(candidate_start, candidate_end, attendees, calendars)
+            if preference_score <= max_preference_score:
+                return ((candidate_start, candidate_end), [])
+            else:
+                print(f"  Slot {candidate_start.strftime('%H:%M')}-{candidate_end.strftime('%H:%M')} rejected due to preference violations (score: {preference_score})")
 
     # Check for free slots between busy periods
-    for _, busy_end in merged_busy_slots:
+    for i, (_, busy_end) in enumerate(merged_busy_slots):
         if search_pointer < busy_end:
             search_pointer = busy_end
         
         gap_start = search_pointer
-        next_busy_start = next((s for s, e in merged_busy_slots if s >= gap_start), None)
+        next_busy_start = merged_busy_slots[i + 1][0] if i + 1 < len(merged_busy_slots) else None
         
-        gap_end = next_busy_start if next_busy_start else search_pointer + meeting_duration * 2 # effectively infinite
-        
-        if gap_start + meeting_duration <= gap_end:
-             return ((gap_start, gap_start + meeting_duration), [])
+        # Check if we can fit a meeting in this gap and within working hours
+        if gap_start + meeting_duration <= (next_busy_start or gap_start + meeting_duration + datetime.timedelta(hours=1)):
+            candidate_start = gap_start
+            candidate_end = candidate_start + meeting_duration
+            
+            # Check working hours constraint
+            if candidate_start.hour >= earliest_start_hour and candidate_end.hour <= latest_end_hour:
+                preference_score = calculate_preference_score(candidate_start, candidate_end, attendees, calendars)
+                if preference_score <= max_preference_score:
+                    return ((candidate_start, candidate_end), [])
+                else:
+                    print(f"  Slot {candidate_start.strftime('%H:%M')}-{candidate_end.strftime('%H:%M')} rejected due to preference violations (score: {preference_score})")
 
     # 3. Second pass: If no free slot, find a reschedulable slot.
-    # We check every existing meeting as a potential start time for our new meeting.
+    print("  No free slots with acceptable preferences found. Checking reschedulable slots...")
+    
     for start, end, priority, summary in all_busy_slots:
         # The potential slot starts when the existing meeting starts.
         potential_start = max(start, search_start_time)
         potential_end = potential_start + meeting_duration
+
+        # Check working hours constraint for potential slot
+        if potential_start.hour < earliest_start_hour or potential_end.hour > latest_end_hour:
+            continue
 
         # Find all events that conflict with this potential new meeting time.
         conflicting_events = [
@@ -215,15 +348,19 @@ def find_earliest_slot(calendars, attendees, duration_minutes, new_meeting_prior
             if event[0] < potential_end and potential_start < event[1]
         ]
 
-        # Check if all conflicting events have a lower priority.
+        # Check if all conflicting events have a lower priority (higher number = lower priority).
         can_reschedule = all(
             new_meeting_priority < conf_priority 
             for _, _, conf_priority, _ in conflicting_events
         )
 
         if can_reschedule:
-            # We found a slot where all conflicts are lower priority.
-            return ((potential_start, potential_end), conflicting_events)
+            # Check preference score for this rescheduled slot
+            preference_score = calculate_preference_score(potential_start, potential_end, attendees, calendars)
+            if preference_score <= max_preference_score:
+                return ((potential_start, potential_end), conflicting_events)
+            else:
+                print(f"  Reschedulable slot {potential_start.strftime('%H:%M')}-{potential_end.strftime('%H:%M')} rejected due to preference violations (score: {preference_score})")
 
     return None # No free or reschedulable slot found.
 
@@ -231,6 +368,7 @@ def find_earliest_slot(calendars, attendees, duration_minutes, new_meeting_prior
 def schedule_meeting_from_request(user_calendars, meeting_request):
     """
     High-level function to handle scheduling based on a specific request format.
+    Includes fallback strategies for when initial scheduling fails.
     """
     print(f"--- Received new meeting request: '{meeting_request.get('Subject', 'No Subject')}' ---")
     
@@ -305,60 +443,128 @@ def schedule_meeting_from_request(user_calendars, meeting_request):
         print(f"Error: Failed to parse calendar data. Details: {e}")
         return None
 
-    # Find suitable slot
+    # Try primary scheduling approach
     try:
         result = find_earliest_slot(parsed_calendars, attendees, duration_minutes, new_meeting_priority, search_start_time=desired_start_time)
+        
+        if result:
+            return _handle_successful_booking(result, meeting_request, new_meeting_priority)
+        
+        # If primary approach fails, try fallback strategies
+        print("\n=== ATTEMPTING FALLBACK STRATEGIES ===")
+        
+        # Fallback 1: Try shorter duration (75% of original)
+        shorter_duration = int(duration_minutes * 0.75)
+        if shorter_duration >= 15:  # Minimum 15 minutes
+            print(f"\nFallback 1: Trying shorter duration ({shorter_duration} minutes instead of {duration_minutes})")
+            result = find_earliest_slot(parsed_calendars, attendees, shorter_duration, new_meeting_priority, search_start_time=desired_start_time)
+            
+            if result:
+                print(f"SUCCESS: Found slot with shorter duration ({shorter_duration} minutes)")
+                return _handle_successful_booking(result, meeting_request, new_meeting_priority, fallback_used="shorter_duration")
+        
+        # Fallback 2: Try with majority attendees (if more than 2 attendees)
+        if len(attendees) > 2:
+            majority_attendees = attendees[:len(attendees)//2 + 1]  # Take majority
+            print(f"\nFallback 2: Trying with majority attendees ({', '.join(majority_attendees)} out of {', '.join(attendees)})")
+            
+            result = find_earliest_slot(parsed_calendars, majority_attendees, duration_minutes, new_meeting_priority, search_start_time=desired_start_time)
+            
+            if result:
+                print(f"SUCCESS: Found slot with majority attendees")
+                return _handle_successful_booking(result, meeting_request, new_meeting_priority, fallback_used="majority_attendees", original_attendees=attendees)
+        
+        # Fallback 3: Try shifting time windows (±30 minutes, ±60 minutes)
+        for shift_minutes in [30, -30, 60, -60]:
+            shifted_start = desired_start_time + datetime.timedelta(minutes=shift_minutes)
+            print(f"\nFallback 3: Trying shifted time window ({shift_minutes:+d} minutes -> {shifted_start.strftime('%H:%M')})")
+            
+            result = find_earliest_slot(parsed_calendars, attendees, duration_minutes, new_meeting_priority, search_start_time=shifted_start)
+            
+            if result:
+                print(f"SUCCESS: Found slot with shifted time window ({shift_minutes:+d} minutes)")
+                return _handle_successful_booking(result, meeting_request, new_meeting_priority, fallback_used="time_shift", shift_minutes=shift_minutes)
+        
+        # Fallback 4: Relax preference constraints (higher tolerance for violations)
+        print(f"\nFallback 4: Relaxing preference constraints (allowing higher violation scores)")
+        result = find_earliest_slot(parsed_calendars, attendees, duration_minutes, new_meeting_priority, 
+                                  search_start_time=desired_start_time, max_preference_score=200)
+        
+        if result:
+            print(f"SUCCESS: Found slot with relaxed preference constraints")
+            return _handle_successful_booking(result, meeting_request, new_meeting_priority, fallback_used="relaxed_preferences")
+        
+        print("\n=== ALL FALLBACK STRATEGIES FAILED ===")
+        
     except Exception as e:
         print(f"Error: Failed to find available slot. Details: {e}")
         return None
 
-    if result:
-        slot, to_reschedule = result
-        print(f"\nSuccess! Earliest slot found for '{meeting_request['Subject']}':")
-        print(f"  Start: {slot[0].strftime('%Y-%m-%d %H:%M %Z%z')}")
-        print(f"  End:   {slot[1].strftime('%Y-%m-%d %H:%M %Z%z')}")
+    print("\nFailure: No available slot could be found, even with fallback strategies.")
+    return {
+        'success': False,
+        'error': 'No available slot found after trying all fallback strategies',
+        'fallbacks_attempted': ['shorter_duration', 'majority_attendees', 'time_shift', 'relaxed_preferences']
+    }
+
+
+def _handle_successful_booking(result, meeting_request, new_meeting_priority, fallback_used=None, **fallback_details):
+    """
+    Helper function to handle successful booking results.
+    """
+    slot, to_reschedule = result
+    
+    print(f"\nSuccess! Earliest slot found for '{meeting_request['Subject']}':")
+    print(f"  Start: {slot[0].strftime('%Y-%m-%d %H:%M %Z%z')}")
+    print(f"  End:   {slot[1].strftime('%Y-%m-%d %H:%M %Z%z')}")
+    
+    if fallback_used:
+        print(f"  Note: Used fallback strategy '{fallback_used}'")
+        if fallback_details:
+            for key, value in fallback_details.items():
+                print(f"    {key}: {value}")
+    
+    if to_reschedule:
+        # Call requirewna function to handle rescheduling
+        meeting_info = {
+            'subject': meeting_request.get('Subject', 'Unknown'),
+            'start_time': slot[0],
+            'end_time': slot[1],
+            'priority': new_meeting_priority
+        }
         
-        if to_reschedule:
-            # Call requirewna function to handle rescheduling
-            meeting_info = {
-                'subject': meeting_request.get('Subject', 'Unknown'),
-                'start_time': slot[0],
-                'end_time': slot[1],
-                'priority': new_meeting_priority
-            }
+        try:
+            rescheduling_result = requirewna(to_reschedule, meeting_info)
+            print(f"\nNOTE: This time requires {len(to_reschedule)} lower-priority meeting(s) to be rescheduled:")
+            for _, _, p, s in to_reschedule:
+                print(f"  - (P{p}) '{s}'")
             
-            try:
-                rescheduling_result = requirewna(to_reschedule, meeting_info)
-                print(f"\nNOTE: This time requires {len(to_reschedule)} lower-priority meeting(s) to be rescheduled:")
-                for _, _, p, s in to_reschedule:
-                    print(f"  - (P{p}) '{s}'")
-                
-                return {
-                    'success': True,
-                    'slot': slot,
-                    'rescheduling_required': True,
-                    'rescheduling_result': rescheduling_result
-                }
-            except Exception as e:
-                print(f"Warning: Rescheduling notification failed. Details: {e}")
-                return {
-                    'success': True,
-                    'slot': slot,
-                    'rescheduling_required': True,
-                    'rescheduling_result': None
-                }
-        else:
-            print("\nThis is a free slot, no rescheduling needed.")
             return {
                 'success': True,
                 'slot': slot,
-                'rescheduling_required': False
+                'rescheduling_required': True,
+                'rescheduling_result': rescheduling_result,
+                'fallback_used': fallback_used,
+                'fallback_details': fallback_details
+            }
+        except Exception as e:
+            print(f"Warning: Rescheduling notification failed. Details: {e}")
+            return {
+                'success': True,
+                'slot': slot,
+                'rescheduling_required': True,
+                'rescheduling_result': None,
+                'fallback_used': fallback_used,
+                'fallback_details': fallback_details
             }
     else:
-        print("\nFailure: No available slot could be found, even with rescheduling.")
+        print("\nThis is a free slot, no rescheduling needed.")
         return {
-            'success': False,
-            'error': 'No available slot found'
+            'success': True,
+            'slot': slot,
+            'rescheduling_required': False,
+            'fallback_used': fallback_used,
+            'fallback_details': fallback_details
         }
 
 
