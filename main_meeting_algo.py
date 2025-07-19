@@ -2,6 +2,41 @@ import datetime
 import collections
 import re
 
+def requirewna(meetings_to_reschedule, new_meeting_info):
+    """
+    Handle necessary actions during rescheduling.
+    This function processes meetings that need to be rescheduled and
+    provides notifications or performs required actions.
+    
+    Args:
+        meetings_to_reschedule (list): List of meeting tuples (start, end, priority, summary)
+        new_meeting_info (dict): Information about the new meeting being scheduled
+    
+    Returns:
+        dict: Result of rescheduling actions
+    """
+    print("\n--- RESCHEDULING REQUIRED ---")
+    print(f"New meeting '{new_meeting_info.get('subject', 'Unknown')}' requires rescheduling of:")
+    
+    rescheduled_meetings = []
+    for start, end, priority, summary in meetings_to_reschedule:
+        print(f"  - (P{priority}) '{summary}' scheduled from {start.strftime('%Y-%m-%d %H:%M')} to {end.strftime('%Y-%m-%d %H:%M')}")
+        rescheduled_meetings.append({
+            'original_start': start,
+            'original_end': end,
+            'priority': priority,
+            'summary': summary,
+            'status': 'needs_rescheduling'
+        })
+    
+    print("--- END RESCHEDULING NOTIFICATION ---\n")
+    
+    return {
+        'action': 'reschedule_required',
+        'meetings_to_reschedule': rescheduled_meetings,
+        'new_meeting': new_meeting_info
+    }
+
 def parse_calendar_data(raw_events):
     """
     Parses a list of event dictionaries, including priority, and converts it
@@ -24,8 +59,8 @@ def parse_calendar_data(raw_events):
     
     # Define default priorities based on summary keywords
     priority_map = {
-        'Client Call': 4,
-        'Design Review': 4,
+        'Client Call': 2,
+        'Design Review': 3,
     }
 
     for event in raw_events:
@@ -147,7 +182,7 @@ def schedule_meeting_from_request(user_calendars, meeting_request):
     print(f"--- Received new meeting request: '{meeting_request.get('Subject', 'No Subject')}' ---")
     
     try:
-        duration_str = meeting_request["DUeing of meeting "]
+        duration_str = meeting_request["Duration of meeting"]
         duration_minutes = int(re.match(r'\d+', duration_str).group())
         
         start_time_str = meeting_request["start time "]
@@ -158,7 +193,7 @@ def schedule_meeting_from_request(user_calendars, meeting_request):
         new_meeting_priority = meeting_request.get("Priority", 1)
         attendees = list(user_calendars.keys())
         
-        print(f"Attempting to book for9: {', '.join(attendees)}")
+        print(f"Attempting to book for: {', '.join(attendees)}")
         print(f"Required duration: {duration_minutes} minutes, Priority: P{new_meeting_priority}")
         print(f"Searching from: {desired_start_time.strftime('%Y-%m-%d %H:%M %Z')}")
 
@@ -178,6 +213,15 @@ def schedule_meeting_from_request(user_calendars, meeting_request):
         print(f"  End:   {slot[1].strftime('%Y-%m-%d %H:%M %Z%z')}")
         
         if to_reschedule:
+            # Call requirewna function to handle rescheduling
+            meeting_info = {
+                'subject': meeting_request.get('Subject', 'Unknown'),
+                'start_time': slot[0],
+                'end_time': slot[1],
+                'priority': new_meeting_priority
+            }
+            requirewna(to_reschedule, meeting_info)
+            
             print("\nNOTE: This time requires the following lower-priority meetings to be rescheduled:")
             for _, _, p, s in to_reschedule:
                 print(f"  - (P{p}) '{s}'")
@@ -206,7 +250,7 @@ if __name__ == "__main__":
     # The algorithm should find the slot at 10:30, suggesting the P2 Client Call be moved.
     MEETING_REQUEST_INPUT = {
         "start time ": "19-07-2025T09:00:00",
-        "DUeing of meeting ": "180 min",
+        "Duration of meeting": "180 min",
         "Subject": "CRITICAL: Production Outage Debrief",
         "EmailContent": "Hi team, we must meet to discuss the production outage.",
         "Priority": 1 # Highest priority
