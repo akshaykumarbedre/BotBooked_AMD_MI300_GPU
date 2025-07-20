@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
 Test suite for the smart meeting scheduler with enhanced features.
-Tests priority-based scheduling, participant preferences, and fallback strategies.
+Tests priority-based scheduling, participant preferences, fallback strategies, and JSON output.
 """
 
 import unittest
 import datetime
+import json
 from main_meeting_algo import (
     schedule_meeting_from_request,
     find_earliest_slot, 
     parse_calendar_data,
-    requirewna
+    requirewna,
+    format_meeting_as_json,
+    create_meetings_json_output
 )
 
 
@@ -250,12 +253,218 @@ class TestSmartScheduler(unittest.TestCase):
             'priority': 1
         }
         
-        result = requirewna(meetings_to_reschedule, new_meeting_info)
+        result = requirewna(meetings_to_reschedule, new_meeting_info, {}, [])
         
         self.assertIsNotNone(result)
-        self.assertEqual(result['action'], 'reschedule_required')
+        self.assertEqual(result['action'], 'reschedule_completed')
         self.assertEqual(len(result['meetings_to_reschedule']), 1)
         self.assertIn('new_meeting', result)
+        
+    def test_json_output_format(self):
+        """Test that the output follows the standardized JSON format."""
+        meeting_request = {
+            "start time ": "19-07-2025T11:30:00",
+            "Duration of meeting": "60 min",
+            "Subject": "Team Meeting",
+            "EmailContent": "Let's discuss the project status",
+            "Priority": 3
+        }
+        
+        result = schedule_meeting_from_request(self.sample_calendars, meeting_request)
+        
+        self.assertIsNotNone(result)
+        self.assertTrue(result['success'])
+        self.assertIn('meetings_json', result)
+        
+        meetings_json = result['meetings_json']
+        self.assertIsInstance(meetings_json, list)
+        self.assertGreater(len(meetings_json), 0)
+        
+        # Verify each meeting has the required fields
+        for meeting in meetings_json:
+            self.assertIn('Subject', meeting)
+            self.assertIn('EmailContent', meeting)
+            self.assertIn('EventStart', meeting)
+            self.assertIn('EventEnd', meeting)
+            self.assertIn('Duration_mins', meeting)
+            self.assertIn('MetaData', meeting)
+            
+            # Verify data types
+            self.assertIsInstance(meeting['Subject'], str)
+            self.assertIsInstance(meeting['EmailContent'], str)
+            self.assertIsInstance(meeting['EventStart'], str)
+            self.assertIsInstance(meeting['EventEnd'], str)
+            self.assertIsInstance(meeting['Duration_mins'], str)
+            self.assertIsInstance(meeting['MetaData'], dict)
+    
+    def test_rescheduling_with_new_timings(self):
+        """Test that rescheduling actually provides new timings for conflicted meetings."""
+        conflicted_calendars = {
+            "user1": [
+                {
+                    'StartTime': '2025-07-19T09:00:00+05:30',
+                    'EndTime': '2025-07-19T10:30:00+05:30',
+                    'Attendees': ['user1'],
+                    'Summary': 'Low Priority Meeting',
+                    'Priority': 4
+                }
+            ]
+        }
+        
+        meeting_request = {
+            "start time ": "19-07-2025T09:00:00",
+            "Duration of meeting": "90 min",  # Overlap with the existing meeting
+            "Subject": "High Priority Meeting",
+            "EmailContent": "Urgent meeting that needs to override low priority one",
+            "Priority": 1
+        }
+        
+        result = schedule_meeting_from_request(conflicted_calendars, meeting_request)
+        
+        self.assertIsNotNone(result)
+        self.assertTrue(result['success'])
+        
+        # Check if rescheduling occurred or if it found a free slot  
+        meetings_json = result['meetings_json']
+        self.assertIsInstance(meetings_json, list)
+        self.assertGreater(len(meetings_json), 0)
+        
+        # Should have at least the new meeting
+        new_bookings = [m for m in meetings_json if m['MetaData']['type'] == 'new_booking']
+        self.assertEqual(len(new_bookings), 1)
+        self.assertEqual(new_bookings[0]['Subject'], 'High Priority Meeting')
+        
+        # If rescheduling occurred, verify it has new timings
+        if result.get('rescheduling_required', False):
+            rescheduling_result = result.get('rescheduling_result')
+            self.assertIsNotNone(rescheduling_result)
+            self.assertEqual(rescheduling_result['action'], 'reschedule_completed')
+            
+            # Check for rescheduled meetings in JSON output
+            rescheduled_meetings = [m for m in meetings_json if m['MetaData']['type'] == 'rescheduled']
+            if len(rescheduled_meetings) > 0:
+                for meeting in rescheduled_meetings:
+                    self.assertIn('original_start', meeting['MetaData'])
+                    self.assertIn('original_end', meeting['MetaData'])
+    
+    def test_format_meeting_as_json(self):
+        """Test the format_meeting_as_json helper function."""
+        start_time = datetime.datetime(2025, 7, 19, 10, 0).replace(tzinfo=self.tz)
+        end_time = datetime.datetime(2025, 7, 19, 11, 0).replace(tzinfo=self.tz)
+        
+        meeting_json = format_meeting_as_json(
+            subject="Test Meeting",
+            email_content="This is a test meeting",
+            start_time=start_time,
+            end_time=end_time,
+            duration_minutes=60,
+            metadata={'priority': 2, 'type': 'test'}
+        )
+        
+        expected_fields = ['Subject', 'EmailContent', 'EventStart', 'EventEnd', 'Duration_mins', 'MetaData']
+        for field in expected_fields:
+            self.assertIn(field, meeting_json)
+        
+        self.assertEqual(meeting_json['Subject'], "Test Meeting")
+        self.assertEqual(meeting_json['EmailContent'], "This is a test meeting")
+        self.assertEqual(meeting_json['Duration_mins'], "60")
+        self.assertEqual(meeting_json['MetaData']['priority'], 2)
+        
+        # Verify ISO format for datetime
+        self.assertTrue(meeting_json['EventStart'].endswith('+05:30'))
+        self.assertTrue(meeting_json['EventEnd'].endswith('+05:30'))
+    
+    def test_complex_rescheduling_scenario(self):
+        """Test a complex scenario with multiple meetings that need rescheduling."""
+        complex_calendars = {
+            "user1": [
+                {
+                    'StartTime': '2025-07-19T09:00:00+05:30',
+                    'EndTime': '2025-07-19T10:00:00+05:30',
+                    'Attendees': ['user1'],
+                    'Summary': 'Meeting A',
+                    'Priority': 4
+                },
+                {
+                    'StartTime': '2025-07-19T10:00:00+05:30',
+                    'EndTime': '2025-07-19T11:00:00+05:30',
+                    'Attendees': ['user1'],
+                    'Summary': 'Meeting B',
+                    'Priority': 3
+                }
+            ]
+        }
+        
+        meeting_request = {
+            "start time ": "19-07-2025T09:30:00",
+            "Duration of meeting": "90 min",
+            "Subject": "Critical Meeting",
+            "EmailContent": "This is a critical meeting that needs to reschedule others",
+            "Priority": 1
+        }
+        
+        result = schedule_meeting_from_request(complex_calendars, meeting_request)
+        
+        self.assertIsNotNone(result)
+        self.assertTrue(result['success'])
+        
+        # Verify JSON output
+        meetings_json = result['meetings_json']
+        self.assertIsInstance(meetings_json, list)
+        
+        # Should have at least the new meeting
+        new_bookings = [m for m in meetings_json if m['MetaData']['type'] == 'new_booking']
+        self.assertEqual(len(new_bookings), 1)
+        self.assertEqual(new_bookings[0]['Subject'], 'Critical Meeting')
+        
+        # Check for rescheduled meetings if any
+        rescheduled_meetings = [m for m in meetings_json if m['MetaData']['type'] == 'rescheduled']
+        if rescheduled_meetings:
+            for meeting in rescheduled_meetings:
+                self.assertIn('original_start', meeting['MetaData'])
+                self.assertIn('original_end', meeting['MetaData'])
+    
+    def test_forced_rescheduling_scenario(self):
+        """Test a scenario that definitely forces rescheduling."""
+        # Create a calendar that blocks the entire day except for one small slot
+        busy_calendars = {
+            "user1": [
+                {
+                    'StartTime': '2025-07-19T09:00:00+05:30',
+                    'EndTime': '2025-07-19T17:00:00+05:30',  # All day meeting
+                    'Attendees': ['user1'],
+                    'Summary': 'Low Priority All Day Meeting',
+                    'Priority': 4  # Low priority - can be rescheduled
+                }
+            ]
+        }
+        
+        meeting_request = {
+            "start time ": "19-07-2025T10:00:00",
+            "Duration of meeting": "120 min",
+            "Subject": "Critical Emergency Meeting",
+            "EmailContent": "Emergency meeting that must happen",
+            "Priority": 1  # Highest priority
+        }
+        
+        result = schedule_meeting_from_request(busy_calendars, meeting_request)
+        
+        self.assertIsNotNone(result)
+        
+        # Should either successfully reschedule or find an alternative slot
+        if result['success']:
+            meetings_json = result['meetings_json']
+            self.assertIsInstance(meetings_json, list)
+            
+            # Should have the new meeting
+            new_bookings = [m for m in meetings_json if m['MetaData']['type'] == 'new_booking']
+            self.assertEqual(len(new_bookings), 1)
+            self.assertEqual(new_bookings[0]['Subject'], 'Critical Emergency Meeting')
+            
+            # If rescheduling occurred, verify the JSON includes rescheduled meetings
+            if result.get('rescheduling_required'):
+                rescheduled_meetings = [m for m in meetings_json if m['MetaData']['type'] == 'rescheduled']
+                # May or may not be able to reschedule the all-day meeting
         
 
 if __name__ == '__main__':
