@@ -1,4 +1,28 @@
 
+"""
+BotBooked AI Scheduling Assistant
+
+This module implements an intelligent AI-powered scheduling assistant that can autonomously
+schedule meetings by analyzing calendar availability, user preferences, and meeting priorities.
+The system integrates with Google Calendar API and uses LLM models for natural language
+processing of meeting requests.
+
+Key Features:
+- Google Calendar integration with OAuth authentication
+- Natural language processing for meeting requests using LangChain/OpenAI
+- Priority-based scheduling with conflict resolution
+- User preference management (working hours, meeting limits, buffers)
+- Automatic rescheduling of lower-priority meetings
+- Multiple fallback strategies for challenging scheduling scenarios
+- LangGraph workflow orchestration for complex scheduling logic
+
+Dependencies:
+- langchain, langchain-openai, langgraph: LLM integration and workflow management
+- google-oauth2, googleapiclient: Google Calendar API access
+- flask: Web server for API endpoints
+- datetime, json, collections, re, os: Standard Python libraries
+"""
+
 import datetime
 import re
 import os
@@ -11,37 +35,87 @@ from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import build
 
 def retrive_calendar_events(user, start, end):
+    """
+    Retrieve calendar events for a specific user within a given time range.
+    
+    This function connects to Google Calendar API using OAuth credentials and fetches
+    all calendar events for the specified user between the start and end times.
+    
+    Args:
+        user (str): Email address of the user whose calendar to retrieve
+        start (str): Start time in ISO format (e.g., '2025-07-17T00:00:00+05:30')
+        end (str): End time in ISO format (e.g., '2025-07-17T23:59:59+05:30')
+    
+    Returns:
+        list: List of dictionaries containing event information with keys:
+            - StartTime: Event start time in ISO format
+            - EndTime: Event end time in ISO format
+            - NumAttendees: Number of unique attendees
+            - Attendees: List of attendee email addresses
+            - Summary: Event title/summary
+    
+    Note:
+        - Requires OAuth token file in 'Keys/{username}.token' format
+        - Handles events without attendees by marking them as "SELF"
+        - Skips all-day events and events without dateTime information
+    """
     events_list = []
+    
+    # Construct path to user's OAuth token file
     token_path = "Keys/"+user.split("@")[0]+".token"
+    
+    # Authenticate with Google Calendar API using stored credentials
     user_creds = Credentials.from_authorized_user_file(token_path)
     calendar_service = build("calendar", "v3", credentials=user_creds)
-    events_result = calendar_service.events().list(calendarId='primary', timeMin=start,timeMax=end,singleEvents=True,orderBy='startTime').execute()
+    
+    # Fetch events from primary calendar within specified time range
+    events_result = calendar_service.events().list(
+        calendarId='primary', 
+        timeMin=start,
+        timeMax=end,
+        singleEvents=True,  # Expand recurring events into individual instances
+        orderBy='startTime'  # Sort events chronologically
+    ).execute()
+    
     events = events_result.get('items')
+    count = 0  # Track events that couldn't be processed
 
-    count=0
+    # Process each event and extract relevant information
     for event in events : 
         attendee_list = []
+        
+        # Extract attendee information, handling events without attendees
         try:
             for attendee in event["attendees"]: 
                 attendee_list.append(attendee['email'])
         except: 
+            # If no attendees field or error, mark as self-meeting
             attendee_list.append("SELF")
+        
+        # Extract event timing and create standardized event object
         try:
-            start_time = event["start"]["dateTime"]
-            end_time = event["end"]["dateTime"]
-            events_list.append(
-                {"StartTime" : start_time, 
-                 "EndTime": end_time, 
-                 "NumAttendees" :len(set(attendee_list)), 
-                 "Attendees" : list(set(attendee_list)),
-                 "Summary" : event["summary"]})
+            start_time = event["start"]["dateTime"]  # ISO format datetime
+            end_time = event["end"]["dateTime"]      # ISO format datetime
+            
+            events_list.append({
+                "StartTime": start_time, 
+                "EndTime": end_time, 
+                "NumAttendees": len(set(attendee_list)),  # Count unique attendees
+                "Attendees": list(set(attendee_list)),    # Remove duplicate attendees
+                "Summary": event["summary"]
+            })
         except Exception as E:
-            count+=1
-    #print('No of exceptions are: ',count)
+            # Skip events without proper datetime information (e.g., all-day events)
+            count += 1
+    
+    # Uncomment to debug skipped events: print('No of exceptions are: ',count)
     return events_list
 
+# Test the calendar retrieval function with sample data
+# This line fetches events for a sample user across a broad date range for testing
 event = retrive_calendar_events("userone.amd@gmail.com", '2023-07-17T00:00:00+05:30', '2026-07-17T23:59:59+05:30')
 
+# Configure LangSmith for LLM tracing and monitoring (optional)
 os.environ["LANGSMITH_API_KEY"] = "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"
 os.environ["LANGSMITH_TRACING"] = "true"
 
@@ -51,12 +125,44 @@ from datetime import datetime
 from langchain_core.output_parsers import JsonOutputParser
 
 def extract_meeting_details_with_llm(email_content, request_datetime_str):
-
-    from datetime import datetime
-    reference_datetime = datetime.strptime(request_datetime_str, "%d-%m-%YT%H:%M:%S")
-    day = reference_datetime.strftime('%A')
+    """
+    Extract meeting details from email content using a Large Language Model.
     
-    # The system prompt now includes few-shot examples
+    This function uses an LLM to parse natural language meeting requests and extract
+    structured information including dates, times, duration, and priority. It handles
+    relative time expressions (e.g., "tomorrow", "next week") by using the provided
+    reference datetime.
+    
+    Args:
+        email_content (str): The natural language content of the meeting request email
+        request_datetime_str (str): Reference datetime in format 'DD-MM-YYYYTHH:MM:SS'
+                                   used to resolve relative time expressions
+    
+    Returns:
+        tuple: A tuple containing:
+            - dict: Parsed meeting details with keys:
+                - chain_of_thought: LLM's reasoning process
+                - start_date: Meeting start date/time in 'DD-MM-YYYYTHH:MM:SS' format
+                - end_date: Meeting end date/time in 'DD-MM-YYYYTHH:MM:SS' format
+                - duration_minutes: Meeting duration in minutes (integer)
+                - priority: Priority level (1=highest to 4=lowest)
+                - summary: Short meeting description
+            - str: Meeting summary/title
+    
+    Note:
+        - Uses ChatOpenAI model with local vLLM server (localhost:8000)
+        - Includes comprehensive prompt with examples for consistent parsing
+        - Has fallback error handling that returns default values
+        - Handles time zone considerations (assumes IST +05:30)
+    """
+    from datetime import datetime
+    
+    # Parse the reference datetime to determine current day of week
+    reference_datetime = datetime.strptime(request_datetime_str, "%d-%m-%YT%H:%M:%S")
+    day = reference_datetime.strftime('%A')  # Get day name (e.g., "Monday")
+    
+    # Comprehensive system prompt with instructions and examples for the LLM
+    # This prompt teaches the LLM how to extract meeting information consistently
     system_prompt = """You are an expert meeting information extraction assistant. Your task is to analyze email content and extract meeting details with precise date and time information.
 
 ## Core Instructions
@@ -172,6 +278,7 @@ Output:
 }}
 """
 
+    # Human message template that will be filled with the actual email content
     human_message = """## Processing Instructions
 
 **Current Datetime:** {request_datetime_str}
@@ -185,41 +292,49 @@ Output:
 
     from langchain_core.prompts import ChatPromptTemplate
 
+    # Create the complete prompt by combining system and human messages
     prompt = ChatPromptTemplate.from_messages([
         ("system", system_prompt),
         ("human", human_message)
     ])
 
+    # Initialize the ChatOpenAI model pointing to local vLLM server
     model = ChatOpenAI(
-        model="Qwen/Qwen3-4B",
-        temperature=0,
-        max_tokens=None,
-        timeout=None,
-        max_retries=2,
-        api_key="abc-123",  # if you prefer to pass api key in directly instaed of using env vars
-        base_url="http://localhost:8000/v1/",
-
-        # organization="...",
-        # other params...
-        
+        model="Qwen/Qwen3-4B",  # Specific model running on vLLM server
+        temperature=0,          # Deterministic output for consistent results
+        max_tokens=None,        # No token limit
+        timeout=None,           # No timeout
+        max_retries=2,          # Retry failed requests twice
+        api_key="abc-123",      # Placeholder API key for local server
+        base_url="http://localhost:8000/v1/",  # Local vLLM server endpoint
     )
 
+    # Create the processing chain: prompt -> model -> output
     chain = prompt | model
+    
     try:
+        # Invoke the LLM with the formatted prompt
         response = chain.invoke({
-            "request_datetime_str" : request_datetime_str,
-            "day" : day,
+            "request_datetime_str": request_datetime_str,
+            "day": day,
             "email_content": email_content
         })
 
+        # Parse the JSON response from the LLM
         output_parser = JsonOutputParser()
-
+        
+        # Handle potential formatting issues in LLM response
+        # Some models include thinking tags that need to be removed
         response.content = response.content.split('</think>')[1]
-        final_response =  output_parser.invoke(response)
+        final_response = output_parser.invoke(response)
+        
         return final_response, final_response['summary']
 
     except (json.JSONDecodeError, AttributeError, KeyError, ValueError) as e:
-        #print(f"Error processing LLM response: {e}")
+        # Fallback response if LLM parsing fails
+        # Uses default values based on the request datetime
+        # This ensures the system continues working even if LLM fails
+        print(f"LLM parsing failed: {e}. Using fallback response.")
         return {
             'chain_of_thought': "Current date: 19-07-2025 (Friday). 'Today' = current date. No specific time mentioned, so applying defaults: start = 12:34:55 (current time), end = 23:59:59. Duration specified: 30 minutes.",
             'start_date': '19-07-2025T12:34:55',
@@ -227,71 +342,120 @@ Output:
             'duration_minutes': 30,
             "priority": 4,
             "summary": ""
-        }
+        }, ""
 
+# Test the LLM extraction function with a sample meeting request
+# This demonstrates how the function parses natural language into structured data
 print(extract_meeting_details_with_llm("Let's sync up on Thursday for half an hour.", "19-07-2025T12:34:55"))
 
 import datetime
 import collections
 import re
 
-# Hardcoded participant preferences
+# ================================================================================================
+# PARTICIPANT PREFERENCES MANAGEMENT
+# ================================================================================================
+
+# Hardcoded participant preferences for meeting scheduling
+# These define working hours, meeting limits, and buffer requirements for each user
+# In a production system, these would be stored in a database or configuration file
 PARTICIPANT_PREFERENCES = {
     "user1": {
         "preferred_hours": {"start": 9, "end": 17},  # 9 AM to 5 PM
-        "max_meetings_per_day": 6,
-        "avoid_back_to_back": True,
-        "buffer_minutes": 15  # Buffer between meetings
+        "max_meetings_per_day": 6,                   # Maximum 6 meetings per day
+        "avoid_back_to_back": True,                  # Prefer buffer between meetings
+        "buffer_minutes": 15                         # 15-minute buffer between meetings
     },
     "user2": {
-        "preferred_hours": {"start": 10, "end": 18},  # 10 AM to 6 PM
-        "max_meetings_per_day": 4,
-        "avoid_back_to_back": True,
-        "buffer_minutes": 30
+        "preferred_hours": {"start": 10, "end": 18}, # 10 AM to 6 PM
+        "max_meetings_per_day": 4,                   # Maximum 4 meetings per day
+        "avoid_back_to_back": True,                  # Prefer buffer between meetings
+        "buffer_minutes": 30                         # 30-minute buffer between meetings
     },
     "user3": {
         "preferred_hours": {"start": 8, "end": 16},  # 8 AM to 4 PM
-        "max_meetings_per_day": 8,
-        "avoid_back_to_back": False,
-        "buffer_minutes": 0
+        "max_meetings_per_day": 8,                   # Maximum 8 meetings per day
+        "avoid_back_to_back": False,                 # Allow back-to-back meetings
+        "buffer_minutes": 0                          # No buffer required
     }
 }
 
 def get_user_preferences(user_id):
     """
-    Get preferences for a specific user.
-    Returns default preferences if user not found.
+    Retrieve user preferences for meeting scheduling.
+    
+    This function returns the preferences for a specific user, including their
+    preferred working hours, daily meeting limits, and buffer requirements.
+    Falls back to sensible defaults if the user is not found in the preferences.
+    
+    Args:
+        user_id (str): User identifier to look up preferences for
+    
+    Returns:
+        dict: User preferences containing:
+            - preferred_hours: Dict with 'start' and 'end' hour values (24-hour format)
+            - max_meetings_per_day: Maximum number of meetings allowed per day
+            - avoid_back_to_back: Boolean indicating if buffers should be enforced
+            - buffer_minutes: Number of minutes buffer required between meetings
+    
+    Example:
+        >>> prefs = get_user_preferences("user1")
+        >>> print(prefs["preferred_hours"])  # {'start': 9, 'end': 17}
     """
+    # Default preferences used when a user is not found in the system
+    # These represent reasonable defaults for most business users
     default_preferences = {
-        "preferred_hours": {"start": 9, "end": 17},
-        "max_meetings_per_day": 5,
-        "avoid_back_to_back": True,
-        "buffer_minutes": 15
+        "preferred_hours": {"start": 9, "end": 17},  # Standard 9-5 working hours
+        "max_meetings_per_day": 5,                   # Reasonable meeting load
+        "avoid_back_to_back": True,                  # Most people prefer buffers
+        "buffer_minutes": 15                         # Standard 15-minute buffer
     }
+    
+    # Return user-specific preferences if they exist, otherwise use defaults
     return PARTICIPANT_PREFERENCES.get(user_id, default_preferences)
 
 def calculate_preference_score(start_time, end_time, attendees, calendars):
     """
-    Calculate a preference score for a given time slot.
-    Lower score is better (0 = perfect, higher = more violations).
+    Calculate a preference violation score for a proposed meeting time slot.
+    
+    This function evaluates how well a proposed meeting time fits with all attendees'
+    preferences and existing schedules. Lower scores are better (0 = perfect match).
+    The scoring system penalizes violations of working hours, daily meeting limits,
+    and back-to-back scheduling constraints.
     
     Args:
         start_time (datetime): Proposed meeting start time
         end_time (datetime): Proposed meeting end time
         attendees (list): List of attendee user IDs
-        calendars (dict): Current calendar data
+        calendars (dict): Current calendar data for all users
+            Format: {user_id: [(start, end, priority, summary), ...]}
         
     Returns:
-        int: Preference violation score (0 = no violations)
+        int: Preference violation score where:
+            - 0 = No violations (perfect fit)
+            - 50+ = Outside preferred working hours
+            - 30+ = Exceeds daily meeting limit
+            - 20+ = Violates back-to-back meeting preferences
+            - Higher scores = more severe violations
+    
+    Scoring System:
+        - Working hours violation: +50 points per person
+        - Daily meeting limit exceeded: +30 points per person  
+        - Back-to-back meeting violation: +20 points per person
+    
+    Note:
+        The function prints detailed violation information for debugging purposes.
     """
     score = 0
-    violations = []
+    violations = []  # Track specific violations for debugging
     
+    # Evaluate preferences for each meeting attendee
     for user_id in attendees:
         preferences = get_user_preferences(user_id)
         user_events = calendars.get(user_id, [])
         
-        # Check preferred hours violation
+        # ===== CHECK 1: PREFERRED WORKING HOURS =====
+        # Verify the meeting falls within the user's preferred working hours
         meeting_start_hour = start_time.hour
         meeting_end_hour = end_time.hour
         pref_start = preferences["preferred_hours"]["start"]
@@ -301,32 +465,37 @@ def calculate_preference_score(start_time, end_time, attendees, calendars):
             score += 50  # Heavy penalty for outside preferred hours
             violations.append(f"{user_id}: Outside preferred hours ({pref_start}-{pref_end})")
         
-        # Check max meetings per day
+        # ===== CHECK 2: DAILY MEETING LIMIT =====
+        # Count how many meetings the user already has on the proposed date
         meeting_date = start_time.date()
         same_day_meetings = [
             event for event in user_events 
-            if event[0].date() == meeting_date
+            if event[0].date() == meeting_date  # event[0] is start_time
         ]
         
         if len(same_day_meetings) >= preferences["max_meetings_per_day"]:
             score += 30  # Penalty for exceeding daily limit
             violations.append(f"{user_id}: Exceeds daily meeting limit ({preferences['max_meetings_per_day']})")
         
-        # Check back-to-back meetings
+        # ===== CHECK 3: BACK-TO-BACK MEETING AVOIDANCE =====
+        # Check if user prefers buffer time between meetings
         if preferences["avoid_back_to_back"]:
             buffer_delta = datetime.timedelta(minutes=preferences["buffer_minutes"])
             
+            # Check each existing meeting for buffer violations
             for event_start, event_end, _, _ in user_events:
-                # Check if new meeting is too close to existing meetings
+                # Calculate time differences between new meeting and existing meetings
                 time_diff_end = abs((event_end - start_time).total_seconds())
                 time_diff_start = abs((end_time - event_start).total_seconds())
                 
+                # Check if the gap is smaller than required buffer time
                 if (time_diff_end < buffer_delta.total_seconds() or
                     time_diff_start < buffer_delta.total_seconds()):
                     score += 20  # Penalty for back-to-back meetings
                     violations.append(f"{user_id}: Back-to-back meeting (needs {preferences['buffer_minutes']}min buffer)")
-                    break
+                    break  # Only count this violation once per user
     
+    # Print detailed violation information for debugging and transparency
     if violations:
         print(f"  Preference violations for slot {start_time.strftime('%H:%M')}-{end_time.strftime('%H:%M')} (score: {score}):")
         for violation in violations:
@@ -336,67 +505,114 @@ def calculate_preference_score(start_time, end_time, attendees, calendars):
 
 def format_meeting_as_json(subject, start_time, end_time, email_content="", metadata=None):
     """
-    Format a meeting into the standardized JSON format.
+    Format a meeting into the standardized JSON format required by the system.
+    
+    This function converts meeting information into the consistent JSON structure
+    used throughout the application for data exchange and storage.
     
     Args:
         subject (str): Meeting subject/title
-        start_time (datetime): Meeting start time
-        end_time (datetime): Meeting end time  
-        email_content (str): Email content for the meeting
-        metadata (dict): Additional metadata
+        start_time (datetime): Meeting start time as datetime object
+        end_time (datetime): Meeting end time as datetime object  
+        email_content (str, optional): Original email content that triggered the meeting
+        metadata (dict, optional): Additional metadata about the meeting (e.g., priority, rescheduled status)
         
     Returns:
-        dict: Meeting in standardized JSON format
+        dict: Meeting in standardized JSON format with keys:
+            - Subject: Meeting title
+            - EmailContent: Original email content
+            - EventStart: Start time in ISO format
+            - EventEnd: End time in ISO format
+            - Duration_mins: Duration in minutes as string
+            - MetaData: Additional information about the meeting
+    
+    Example:
+        >>> meeting = format_meeting_as_json(
+        ...     "Team Sync", 
+        ...     datetime(2025, 7, 24, 10, 0), 
+        ...     datetime(2025, 7, 24, 11, 0),
+        ...     metadata={"priority": 2}
+        ... )
+        >>> print(meeting["Duration_mins"])  # "60"
     """
+    # Initialize metadata if not provided
     if metadata is None:
         metadata = {}
         
+    # Calculate meeting duration in minutes
     duration_mins = int((end_time - start_time).total_seconds() / 60)
     
+    # Return standardized JSON structure
     return {
         "Subject": subject,
         "EmailContent": email_content,
-        "EventStart": start_time.isoformat(),
-        "EventEnd": end_time.isoformat(),
-        "Duration_mins": str(duration_mins),
+        "EventStart": start_time.isoformat(),      # ISO format for consistent datetime representation
+        "EventEnd": end_time.isoformat(),          # ISO format for consistent datetime representation  
+        "Duration_mins": str(duration_mins),       # String format as required by API specification
         "MetaData": metadata
     }
 
+# ================================================================================================
+# MEETING RESCHEDULING SYSTEM
+# ================================================================================================
+
 def reschedule_meetings_recursively(meetings_to_reschedule, updated_calendars, attendees_map, search_start_time):
     """
-    Recursively reschedule meetings using the same scheduling logic.
+    Recursively reschedule meetings that were displaced by a higher-priority meeting.
+    
+    This function is the core of the intelligent rescheduling system. When a new high-priority
+    meeting displaces existing lower-priority meetings, this function finds new time slots
+    for all displaced meetings. It uses the same scheduling logic as the original scheduler
+    but with more lenient constraints to ensure displaced meetings can be accommodated.
     
     Args:
-        meetings_to_reschedule (list): List of meeting tuples (start, end, priority, summary)
+        meetings_to_reschedule (list): List of meeting tuples to reschedule
+            Format: [(start_time, end_time, priority, summary), ...]
         updated_calendars (dict): Current calendar state after new meeting is added
-        attendees_map (dict): Mapping of meeting summaries to their attendees
-        search_start_time (datetime): Start time for searching new slots
+            Format: {user_id: [(start, end, priority, summary), ...]}
+        attendees_map (dict): Mapping of meeting summaries to their attendee lists
+            Format: {meeting_summary: [attendee_list]}
+        search_start_time (datetime): Earliest time to start searching for new slots
         
     Returns:
         list: List of successfully rescheduled meetings in JSON format
+              Includes both successful reschedules and failed attempts
+    
+    Process:
+        1. For each displaced meeting, calculate original duration
+        2. Find attendees using the attendees_map
+        3. Use find_earliest_slot() to locate new time slot
+        4. Update calendars with the new meeting time
+        5. Handle any cascading conflicts recursively
+        6. Format results as JSON for consistent API response
+    
+    Note:
+        - Uses more lenient preference constraints (max_preference_score=150)
+        - Marks failed reschedules for manual intervention
+        - Handles cascading conflicts (when rescheduling creates new conflicts)
     """
     rescheduled_meetings = []
     
+    # Process each meeting that needs to be rescheduled
     for original_start, original_end, priority, summary in meetings_to_reschedule:
-        # Calculate original duration
+        # Calculate the original duration to maintain meeting length
         original_duration = int((original_end - original_start).total_seconds() / 60)
         
-        # Get attendees for this meeting (use a reasonable default if not found)
+        # Get attendees for this meeting (fallback to all calendar users if not specified)
         meeting_attendees = attendees_map.get(summary, list(updated_calendars.keys()))
-        
         
         print(f"\n  Attempting to reschedule: (P{priority}) '{summary}'")
         print(f"    Original time: {original_start.strftime('%Y-%m-%d %H:%M')} - {original_end.strftime('%Y-%m-%d %H:%M')}")
         print(f"    Duration: {original_duration} minutes, Attendees: {', '.join(meeting_attendees)}")
         
-        # Find new slot for this meeting
+        # Find new slot for this meeting using the same scheduling algorithm
         result = find_earliest_slot(
             updated_calendars, 
             meeting_attendees, 
             original_duration, 
             priority, 
             search_start_time=search_start_time,
-            max_preference_score=150  # Be more lenient for rescheduled meetings
+            max_preference_score=150  # More lenient for rescheduled meetings
         )
         
         if result:
@@ -405,40 +621,46 @@ def reschedule_meetings_recursively(meetings_to_reschedule, updated_calendars, a
             
             print(f"    ✅ New time found: {new_start.strftime('%Y-%m-%d %H:%M')} - {new_end.strftime('%Y-%m-%d %H:%M')}")
             
-            # Add rescheduled meeting to calendars
+            # Add the rescheduled meeting to all attendees' calendars
             for attendee in meeting_attendees:
                 if attendee in updated_calendars:
                     updated_calendars[attendee].append((new_start, new_end, priority, summary))
             
-            # Format as JSON
+            # Format the rescheduled meeting as JSON
             rescheduled_meeting = format_meeting_as_json(
                 subject=summary,
                 start_time=new_start,
                 end_time=new_end,
                 email_content=f"Rescheduled meeting: {summary}",
-                metadata={"rescheduled": True, "original_start": original_start.isoformat()}
+                metadata={
+                    "rescheduled": True, 
+                    "original_start": original_start.isoformat()
+                }
             )
             rescheduled_meetings.append(rescheduled_meeting)
             
-            # Handle any further conflicts recursively
+            # Handle cascading conflicts if rescheduling this meeting displaces others
             if further_conflicts:
                 print(f"    ⚠️  Rescheduling this meeting requires {len(further_conflicts)} more meetings to be moved")
                 further_rescheduled = reschedule_meetings_recursively(
                     further_conflicts, 
                     updated_calendars, 
                     attendees_map, 
-                    new_end  # Start searching after this meeting
+                    new_end  # Start searching after this meeting ends
                 )
                 rescheduled_meetings.extend(further_rescheduled)
         else:
+            # Failed to find alternative slot - mark for manual intervention
             print(f"    ❌ Could not find alternative slot for '{summary}'")
-            # Add to failed rescheduling list with original time as fallback
             failed_meeting = format_meeting_as_json(
                 subject=f"[NEEDS MANUAL RESCHEDULING] {summary}",
                 start_time=original_start,
                 end_time=original_end,
                 email_content=f"This meeting could not be automatically rescheduled and needs manual intervention: {summary}",
-                metadata={"rescheduled": False, "needs_manual_intervention": True}
+                metadata={
+                    "rescheduled": False, 
+                    "needs_manual_intervention": True
+                }
             )
             rescheduled_meetings.append(failed_meeting)
     
@@ -446,34 +668,62 @@ def reschedule_meetings_recursively(meetings_to_reschedule, updated_calendars, a
 
 def requirewna(meetings_to_reschedule, new_meeting_info, calendars=None, attendees_map=None):
     """
-    Handle necessary actions during rescheduling.
-    This function now actually reschedules meetings using the same scheduling logic.
+    Handle necessary actions during meeting rescheduling workflow.
+    
+    This function coordinates the rescheduling process when a new high-priority meeting
+    conflicts with existing lower-priority meetings. It serves as the main orchestrator
+    for the rescheduling workflow, delegating the actual scheduling work to specialized
+    functions while providing comprehensive logging and error handling.
     
     Args:
-        meetings_to_reschedule (list): List of meeting tuples (start, end, priority, summary)
-        new_meeting_info (dict): Information about the new meeting being scheduled
-        calendars (dict): Current calendar state (optional)
-        attendees_map (dict): Mapping of meeting summaries to attendees (optional)
+        meetings_to_reschedule (list): List of meeting tuples that need to be rescheduled
+            Format: [(start_time, end_time, priority, summary), ...]
+        new_meeting_info (dict): Information about the new meeting causing the conflicts
+            Required keys: subject, start_time, end_time, priority
+        calendars (dict, optional): Current calendar state for all users
+            Format: {user_id: [(start, end, priority, summary), ...]}
+        attendees_map (dict, optional): Mapping of meeting summaries to attendee lists
+            Format: {meeting_summary: [attendee_list]}
     
     Returns:
-        dict: Result of rescheduling actions including rescheduled meetings
+        dict: Comprehensive result of rescheduling actions containing:
+            - action: Always 'reschedule_required'
+            - meetings_to_reschedule: List of processed meeting results
+            - new_meeting: Information about the triggering meeting
+            - rescheduling_successful: Boolean indicating if automatic rescheduling worked
+    
+    Workflow:
+        1. Log all meetings that need rescheduling
+        2. If calendar data provided, attempt automatic rescheduling:
+           - Remove conflicting meetings from calendars
+           - Add new meeting to calendars
+           - Recursively reschedule displaced meetings
+        3. If no calendar data, return meetings marked for manual intervention
+        4. Return comprehensive status report
+    
+    Note:
+        - Provides detailed console output for debugging and monitoring
+        - Handles both successful automatic rescheduling and manual fallback scenarios
+        - Creates default attendee mappings if not provided
     """
     print("\n--- RESCHEDULING REQUIRED ---")
     print(f"New meeting '{new_meeting_info.get('subject', 'Unknown')}' requires rescheduling of:")
     
+    # Log all meetings that need to be rescheduled for transparency
     for start, end, priority, summary in meetings_to_reschedule:
         print(f"  - (P{priority}) '{summary}' scheduled from {start.strftime('%Y-%m-%d %H:%M')} to {end.strftime('%Y-%m-%d %H:%M')}")
     
     rescheduled_meetings = []
     
-    # If calendars provided, attempt actual rescheduling
+    # Attempt automatic rescheduling if calendar data is available
     if calendars is not None:
         print("\n--- ATTEMPTING AUTOMATIC RESCHEDULING ---")
         
-        # Create a copy of calendars with the new meeting added
+        # Create working copy of calendars with the new meeting integration
         updated_calendars = {user: events.copy() for user, events in calendars.items()}
         
-        # Remove the conflicting meetings from calendars
+        # Remove the conflicting meetings from the working calendars
+        # This clears the time slots so they can be used for rescheduling
         for user, events in updated_calendars.items():
             updated_calendars[user] = [
                 event for event in events 
@@ -483,24 +733,26 @@ def requirewna(meetings_to_reschedule, new_meeting_info, calendars=None, attende
                 )
             ]
         
-        # Add the new meeting to calendars
+        # Add the new high-priority meeting to the calendars
         new_start = new_meeting_info.get('start_time')
         new_end = new_meeting_info.get('end_time')
         new_priority = new_meeting_info.get('priority', 1)
         new_subject = new_meeting_info.get('subject', 'New Meeting')
         
         if new_start and new_end:
-            # Add new meeting to all attendees' calendars
+            # Add new meeting to all relevant attendees' calendars
             for user in updated_calendars.keys():
                 updated_calendars[user].append((new_start, new_end, new_priority, new_subject))
         
-        # Use default attendees mapping if not provided
+        # Create default attendees mapping if not provided
+        # Assumes all calendar users are potential attendees for any meeting
         if attendees_map is None:
             attendees_map = {summary: list(calendars.keys()) for _, _, _, summary in meetings_to_reschedule}
         
-        # Search for new slots starting after the new meeting
+        # Start searching for new time slots after the new meeting ends
         search_start = new_end if new_end else datetime.datetime.now().astimezone()
         
+        # Delegate the actual rescheduling work to the recursive function
         rescheduled_meetings = reschedule_meetings_recursively(
             meetings_to_reschedule,
             updated_calendars,
@@ -510,8 +762,8 @@ def requirewna(meetings_to_reschedule, new_meeting_info, calendars=None, attende
         
         print(f"\n--- RESCHEDULING COMPLETE: {len(rescheduled_meetings)} meetings processed ---")
     else:
+        # Fallback when no calendar data is provided - mark for manual intervention
         print("\n--- CALENDAR DATA NOT PROVIDED: Cannot perform automatic rescheduling ---")
-        # Fallback to old behavior if no calendar data
         for start, end, priority, summary in meetings_to_reschedule:
             fallback_meeting = {
                 'original_start': start,
@@ -524,6 +776,7 @@ def requirewna(meetings_to_reschedule, new_meeting_info, calendars=None, attende
     
     print("--- END RESCHEDULING NOTIFICATION ---\n")
     
+    # Return comprehensive status report
     return {
         'action': 'reschedule_required',
         'meetings_to_reschedule': rescheduled_meetings,
@@ -531,38 +784,72 @@ def requirewna(meetings_to_reschedule, new_meeting_info, calendars=None, attende
         'rescheduling_successful': calendars is not None
     }
 
+# ================================================================================================
+# CALENDAR DATA PROCESSING
+# ================================================================================================
+
 def parse_calendar_data(raw_events):
     """
-    Parses a list of event dictionaries, including priority, and converts it
-    into the format expected by the scheduling functions.
-
-    It assigns default priorities if they are not specified.
-    Priority Scale: Lower number is higher priority (1 is highest).
-    - P2: 'Client Call'
-    - P3: 'Design Review'
-    - P4: Default for others
-
+    Parse raw calendar events into the internal format used by scheduling algorithms.
+    
+    This function converts calendar events from the Google Calendar API format into
+    the standardized internal representation used throughout the scheduling system.
+    It handles priority assignment, data validation, and error recovery to ensure
+    robust processing of real-world calendar data.
+    
     Args:
-        raw_events (list): A list of dictionaries representing calendar events.
+        raw_events (list): List of calendar event dictionaries from Google Calendar API
+            Expected format per event:
+            {
+                'StartTime': '2025-07-24T10:00:00+05:30',
+                'EndTime': '2025-07-24T11:00:00+05:30',
+                'Summary': 'Meeting Title',
+                'Attendees': ['user1@example.com', 'user2@example.com'],
+                'Priority': 2  # Optional, will be auto-assigned if missing
+            }
 
     Returns:
-        dict: A dictionary where keys are user IDs and values are lists of
-              their scheduled meetings as (start, end, priority, summary) tuples.
+        dict: Parsed calendar data organized by user with format:
+            {
+                user_id: [(start_datetime, end_datetime, priority, summary), ...],
+                ...
+            }
+            Where each tuple represents a scheduled meeting for that user.
+    
+    Priority Assignment Logic:
+        - Explicit Priority: Uses the 'Priority' field if present (1-4 scale)
+        - Keyword-based: Assigns priorities based on meeting title keywords:
+          * 'Client Call' → Priority 2 (high importance)
+          * 'Design Review' → Priority 3 (medium importance)  
+        - Default: Priority 4 (lowest) for all other meetings
+    
+    Data Validation:
+        - Skips events missing required fields (StartTime, EndTime, Attendees)
+        - Validates datetime parsing and chronological order
+        - Ensures priority values are within valid range (1-4)
+        - Handles malformed attendee data gracefully
+    
+    Error Handling:
+        - Logs detailed error messages for debugging
+        - Continues processing remaining events if individual events fail
+        - Returns empty dict if no valid events found
     """
     if not raw_events:
         return {}
         
     parsed_calendars = collections.defaultdict(list)
     
-    # Define default priorities based on summary keywords
+    # Define priority mapping based on meeting title keywords
+    # This provides intelligent priority assignment for meetings without explicit priorities
     priority_map = {
-        'Client Call': 2,
-        'Design Review': 3,
+        'Client Call': 2,      # High priority - client interactions are important
+        'Design Review': 3,    # Medium priority - internal review processes
     }
 
+    # Process each calendar event with comprehensive error handling
     for event in raw_events:
         try:
-            # Validate required fields
+            # ===== BASIC VALIDATION =====
             if not isinstance(event, dict):
                 print(f"Skipping invalid event (not a dictionary): {event}")
                 continue
@@ -575,62 +862,125 @@ def parse_calendar_data(raw_events):
                 print(f"Skipping event with no attendees: {event}")
                 continue
             
-            # Parse times
+            # ===== DATETIME PARSING =====
             start_time = datetime.datetime.fromisoformat(event['StartTime'])
             end_time = datetime.datetime.fromisoformat(event['EndTime'])
             
-            # Validate time order
+            # Validate chronological order
             if start_time >= end_time:
                 print(f"Skipping event with invalid time order (start >= end): {event}")
                 continue
             
+            # ===== EXTRACT MEETING DETAILS =====
             summary = event.get('Summary', 'No Title')
             
-            # Determine priority: Use explicit priority if given, otherwise use map or default.
+            # ===== PRIORITY DETERMINATION =====
+            # Use explicit priority if provided, otherwise use keyword mapping or default
             priority = event.get('Priority')
             if priority is None:
+                # Search for keywords in summary to assign appropriate priority
                 priority = next((p for keyword, p in priority_map.items() if keyword in summary), 4)
             
-            # Validate priority
+            # Validate priority is within acceptable range
             if not isinstance(priority, int) or priority < 1 or priority > 4:
                 print(f"Skipping event with invalid priority {priority}: {event}")
                 continue
 
-            # Add event to each attendee's calendar
+            # ===== ADD TO ATTENDEE CALENDARS =====
+            # Add this event to each attendee's individual calendar
             for attendee in event['Attendees']:
                 if not attendee or not isinstance(attendee, str):
                     print(f"Skipping invalid attendee '{attendee}' in event: {event}")
                     continue
                     
+                # Store as tuple: (start_time, end_time, priority, summary)
                 parsed_calendars[attendee].append((start_time, end_time, priority, summary))
 
         except (KeyError, TypeError, ValueError) as e:
+            # Log parsing errors but continue processing other events
             print(f"Skipping an event due to a parsing error: {e}. Event data: {event}")
             continue
             
+    # Convert defaultdict to regular dict for consistent return type
     return dict(parsed_calendars)
+
+# ================================================================================================
+# CORE SCHEDULING ALGORITHM
+# ================================================================================================
 
 def find_earliest_slot(calendars, attendees, duration_minutes, new_meeting_priority, search_start_time=None, max_preference_score=100):
     """
-    Finds the earliest possible time slot, considering meeting priorities and participant preferences.
-
-    It first searches for a completely empty slot with acceptable preference score. If none is found, 
-    it then looks for slots occupied by meetings of a lower priority that can be rescheduled.
-    Finally, it respects working hours and preference constraints.
-
+    Find the earliest available time slot for a meeting using intelligent scheduling algorithms.
+    
+    This is the core scheduling function that implements a sophisticated two-pass algorithm:
+    1. First pass: Look for completely free time slots with acceptable preference scores
+    2. Second pass: If no free slots, find slots with lower-priority meetings that can be rescheduled
+    
+    The algorithm respects user preferences, working hours, and implements a priority-based
+    conflict resolution system where higher-priority meetings can displace lower-priority ones.
+    
     Args:
-        calendars (dict): Parsed calendar data with priorities.
-        attendees (list): List of user IDs for the meeting.
-        duration_minutes (int): The required duration of the meeting.
-        new_meeting_priority (int): The priority of the meeting to be scheduled.
-        search_start_time (datetime.datetime, optional): The time to start searching from.
-        max_preference_score (int): Maximum acceptable preference violation score.
-
+        calendars (dict): Parsed calendar data for all users
+            Format: {user_id: [(start_time, end_time, priority, summary), ...]}
+        attendees (list): List of user IDs who must attend the meeting
+        duration_minutes (int): Required meeting duration in minutes (must be positive)
+        new_meeting_priority (int): Priority of new meeting (1=highest to 4=lowest)
+        search_start_time (datetime, optional): Earliest time to consider for scheduling
+            Defaults to current time if not provided
+        max_preference_score (int, optional): Maximum acceptable preference violation score
+            Default is 100; higher values are more lenient about preference violations
+    
     Returns:
-        tuple or None: A tuple of ( (start_time, end_time), list_of_meetings_to_reschedule ).
-                       Returns None if no suitable slot is found.
+        tuple or None: Returns None if no suitable slot found, otherwise:
+            ((start_time, end_time), list_of_displaced_meetings)
+            Where displaced_meetings contains meetings that need rescheduling:
+            [(start_time, end_time, priority, summary), ...]
+    
+    Algorithm Details:
+        
+        PHASE 1: FREE SLOT SEARCH
+        - Merges all attendees' busy time slots into consolidated busy periods
+        - Searches for gaps between meetings that can accommodate the new meeting
+        - Applies working hours constraints based on attendee preferences
+        - Validates preference scores (working hours, daily limits, buffers)
+        
+        PHASE 2: RESCHEDULABLE SLOT SEARCH  
+        - If no free slots found, examines existing meetings for rescheduling potential
+        - Only considers displacing meetings with lower priority (higher number)
+        - Ensures all conflicting meetings have lower priority before suggesting displacement
+        - Applies same preference scoring as Phase 1
+    
+    Working Hours Logic:
+        - Determines working hours window from all attendees' preferences
+        - Uses earliest start time and latest end time across all attendees
+        - Ensures meeting fits within this combined window
+    
+    Preference Scoring:
+        - Calculates violation score for each proposed time slot
+        - Considers working hours, daily meeting limits, back-to-back conflicts
+        - Rejects slots exceeding max_preference_score threshold
+    
+    Priority-Based Rescheduling:
+        - Lower priority number = higher priority (P1 > P2 > P3 > P4)
+        - New meeting can only displace meetings with strictly lower priority
+        - All conflicting meetings must be displaceable for slot to be viable
+    
+    Examples:
+        >>> calendars = {"user1": [(datetime(2025,7,24,10,0), datetime(2025,7,24,11,0), 3, "Meeting")]}
+        >>> result = find_earliest_slot(calendars, ["user1"], 60, 2)
+        >>> if result:
+        ...     slot, conflicts = result
+        ...     print(f"Found slot: {slot[0]} to {slot[1]}")
+    
+    Raises:
+        ValueError: If attendees list is empty, duration is non-positive, or priority is invalid
+    
+    Note:
+        - Prints detailed debugging information about the search process
+        - More lenient preference scoring for rescheduled meetings
+        - Handles timezone-aware datetime objects consistently
     """
-    # Validate inputs
+    # ===== INPUT VALIDATION =====
     if not calendars:
         calendars = {}
         
@@ -646,23 +996,24 @@ def find_earliest_slot(calendars, attendees, duration_minutes, new_meeting_prior
     if search_start_time is None:
         search_start_time = datetime.datetime.now().astimezone()
     
-    # Validate search start time
     if not isinstance(search_start_time, datetime.datetime):
         raise ValueError("search_start_time must be a datetime object")
 
     meeting_duration = datetime.timedelta(minutes=duration_minutes)
     
-    # Determine working hours constraints based on attendee preferences
+    # ===== WORKING HOURS CONSTRAINT CALCULATION =====
+    # Determine the acceptable working hours window by combining all attendees' preferences
     earliest_start_hour = min(get_user_preferences(user)["preferred_hours"]["start"] for user in attendees)
     latest_end_hour = max(get_user_preferences(user)["preferred_hours"]["end"] for user in attendees)
     
-    # Adjust search start time to respect working hours
+    # Adjust search start time to respect working hours if needed
     if search_start_time.hour < earliest_start_hour:
         search_start_time = search_start_time.replace(hour=earliest_start_hour, minute=0, second=0, microsecond=0)
     
     print(f"  Working hours constraint: {earliest_start_hour}:00 - {latest_end_hour}:00")
     
-    # 1. Aggregate all busy slots from all attendees.
+    # ===== PHASE 1: AGGREGATE AND MERGE BUSY SLOTS =====
+    # Collect all busy time slots from all attendees
     all_busy_slots = []
     for user_id in attendees:
         if user_id in calendars:
@@ -670,33 +1021,35 @@ def find_earliest_slot(calendars, attendees, duration_minutes, new_meeting_prior
             if isinstance(user_events, list):
                 all_busy_slots.extend(user_events)
     
-    # Sort by start time to allow chronological searching.
+    # Sort busy slots chronologically for efficient gap detection
     all_busy_slots.sort(key=lambda x: x[0])
 
-    # 2. First pass: Find a purely free slot with acceptable preference score.
+    # ===== PHASE 1: FIND FREE SLOTS WITH PREFERENCE VALIDATION =====
+    # Merge overlapping busy slots to create consolidated busy periods
     merged_busy_slots = []
     if all_busy_slots:
-        # We only care about the time intervals for this pass.
+        # Extract just the time intervals for merging (ignore priority and summary)
         time_intervals = [(s, e) for s, e, p, summ in all_busy_slots]
         if time_intervals:
             merged_busy_slots.append(time_intervals[0])
             for current_start, current_end in time_intervals[1:]:
                 last_merged_start, last_merged_end = merged_busy_slots[-1]
                 if current_start < last_merged_end:
+                    # Overlapping intervals - merge them
                     merged_busy_slots[-1] = (last_merged_start, max(last_merged_end, current_end))
                 else:
+                    # Non-overlapping - add as separate busy period
                     merged_busy_slots.append((current_start, current_end))
 
-    # Check for a free slot before the first busy period
+    # Check for free slot before the first busy period
     search_pointer = search_start_time
     first_busy_start = merged_busy_slots[0][0] if merged_busy_slots else None
     
-    # Check if we can fit before first meeting and within working hours
     if not first_busy_start or search_pointer + meeting_duration <= first_busy_start:
         candidate_start = search_pointer
         candidate_end = candidate_start + meeting_duration
         
-        # Check working hours constraint
+        # Validate working hours constraint
         if candidate_end.hour <= latest_end_hour:
             preference_score = calculate_preference_score(candidate_start, candidate_end, attendees, calendars)
             if preference_score <= max_preference_score:
@@ -712,12 +1065,12 @@ def find_earliest_slot(calendars, attendees, duration_minutes, new_meeting_prior
         gap_start = search_pointer
         next_busy_start = merged_busy_slots[i + 1][0] if i + 1 < len(merged_busy_slots) else None
         
-        # Check if we can fit a meeting in this gap and within working hours
+        # Check if meeting fits in this gap and within working hours
         if gap_start + meeting_duration <= (next_busy_start or gap_start + meeting_duration + datetime.timedelta(hours=1)):
             candidate_start = gap_start
             candidate_end = candidate_start + meeting_duration
             
-            # Check working hours constraint
+            # Validate working hours constraint
             if candidate_start.hour >= earliest_start_hour and candidate_end.hour <= latest_end_hour:
                 preference_score = calculate_preference_score(candidate_start, candidate_end, attendees, calendars)
                 if preference_score <= max_preference_score:
@@ -725,39 +1078,43 @@ def find_earliest_slot(calendars, attendees, duration_minutes, new_meeting_prior
                 else:
                     print(f"  Slot {candidate_start.strftime('%H:%M')}-{candidate_end.strftime('%H:%M')} rejected due to preference violations (score: {preference_score})")
 
-    # 3. Second pass: If no free slot, find a reschedulable slot.
+    # ===== PHASE 2: PRIORITY-BASED RESCHEDULING SEARCH =====
     print("  No free slots with acceptable preferences found. Checking reschedulable slots...")
     
+    # Examine each existing meeting as a potential slot for the new meeting
     for start, end, priority, summary in all_busy_slots:
-        # The potential slot starts when the existing meeting starts.
+        # Calculate potential meeting time starting when existing meeting starts
         potential_start = max(start, search_start_time)
         potential_end = potential_start + meeting_duration
 
-        # Check working hours constraint for potential slot
+        # Validate working hours constraint for potential slot
         if potential_start.hour < earliest_start_hour or potential_end.hour > latest_end_hour:
             continue
 
-        # Find all events that conflict with this potential new meeting time.
+        # Find all meetings that would conflict with this potential new meeting time
         conflicting_events = [
             event for event in all_busy_slots 
-            if event[0] < potential_end and potential_start < event[1]
+            if event[0] < potential_end and potential_start < event[1]  # Time overlap check
         ]
 
-        # Check if all conflicting events have a lower priority (higher number = lower priority).
+        # Check if ALL conflicting events have lower priority than the new meeting
+        # (Higher priority number = lower actual priority: P1 > P2 > P3 > P4)
         can_reschedule = all(
             new_meeting_priority < conf_priority 
             for _, _, conf_priority, _ in conflicting_events
         )
 
         if can_reschedule:
-            # Check preference score for this rescheduled slot
+            # Validate preference score for this rescheduled slot
             preference_score = calculate_preference_score(potential_start, potential_end, attendees, calendars)
             if preference_score <= max_preference_score:
+                # Found viable slot that requires rescheduling lower-priority meetings
                 return ((potential_start, potential_end), conflicting_events)
             else:
                 print(f"  Reschedulable slot {potential_start.strftime('%H:%M')}-{potential_end.strftime('%H:%M')} rejected due to preference violations (score: {preference_score})")
 
-    return None # No free or reschedulable slot found.
+    # No suitable slot found in either phase
+    return None
 
 
 def schedule_meeting_from_request(user_calendars, meeting_request):
