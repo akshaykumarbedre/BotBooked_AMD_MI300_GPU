@@ -1,6 +1,7 @@
 import datetime
 import collections
 import re
+import json
 
 # Hardcoded participant preferences
 PARTICIPANT_PREFERENCES = {
@@ -101,38 +102,161 @@ def calculate_preference_score(start_time, end_time, attendees, calendars):
     
     return score
 
-def requirewna(meetings_to_reschedule, new_meeting_info):
+def format_meeting_to_json(subject, email_content, start_time, end_time, duration_mins, metadata=None):
+    """
+    Format meeting information into the required JSON format.
+    
+    Args:
+        subject (str): Meeting subject
+        email_content (str): Email content for the meeting
+        start_time (datetime): Meeting start time
+        end_time (datetime): Meeting end time
+        duration_mins (int): Duration in minutes
+        metadata (dict): Additional metadata (optional)
+    
+    Returns:
+        dict: Meeting information in required JSON format
+    """
+    if metadata is None:
+        metadata = {}
+    
+    return {
+        "Subject": subject,
+        "EmailContent": email_content,
+        "EventStart": start_time.isoformat(),
+        "EventEnd": end_time.isoformat(),
+        "Duration_mins": str(duration_mins),
+        "MetaData": metadata
+    }
+
+
+def requirewna(meetings_to_reschedule, new_meeting_info, all_calendars=None):
     """
     Handle necessary actions during rescheduling.
     This function processes meetings that need to be rescheduled and
-    provides notifications or performs required actions.
+    actually finds new time slots for them using the same scheduling logic.
     
     Args:
         meetings_to_reschedule (list): List of meeting tuples (start, end, priority, summary)
         new_meeting_info (dict): Information about the new meeting being scheduled
+        all_calendars (dict): Current calendar data to find rescheduling slots
     
     Returns:
-        dict: Result of rescheduling actions
+        dict: Result of rescheduling actions with new time slots
     """
     print("\n--- RESCHEDULING REQUIRED ---")
     print(f"New meeting '{new_meeting_info.get('subject', 'Unknown')}' requires rescheduling of:")
     
     rescheduled_meetings = []
+    failed_reschedules = []
+    
     for start, end, priority, summary in meetings_to_reschedule:
         print(f"  - (P{priority}) '{summary}' scheduled from {start.strftime('%Y-%m-%d %H:%M')} to {end.strftime('%Y-%m-%d %H:%M')}")
-        rescheduled_meetings.append({
-            'original_start': start,
-            'original_end': end,
-            'priority': priority,
-            'summary': summary,
-            'status': 'needs_rescheduling'
-        })
+        
+        # Calculate duration for rescheduling
+        duration_mins = int((end - start).total_seconds() / 60)
+        
+        # Try to find a new slot for this meeting
+        # Start searching from the end of the new meeting
+        search_start = new_meeting_info.get('end_time', start)
+        
+        # Use all_calendars if provided, otherwise create a simplified calendar structure
+        if all_calendars:
+            # Remove the current meeting from calendars to avoid conflicts during rescheduling
+            temp_calendars = {}
+            for user_id, events in all_calendars.items():
+                temp_calendars[user_id] = [
+                    event for event in events 
+                    if not (event[0] == start and event[1] == end and event[3] == summary)
+                ]
+            
+            # Add the new meeting to the calendars
+            new_start = new_meeting_info.get('start_time')
+            new_end = new_meeting_info.get('end_time')
+            new_priority = new_meeting_info.get('priority', 1)
+            new_subject = new_meeting_info.get('subject', 'New Meeting')
+            
+            if new_start and new_end:
+                for user_id in temp_calendars.keys():
+                    temp_calendars[user_id].append((new_start, new_end, new_priority, new_subject))
+            
+            # Try to find a new slot for the displaced meeting
+            # Assume all current attendees for simplicity (this could be enhanced with actual attendee tracking)
+            attendees = list(temp_calendars.keys())
+            
+            try:
+                result = find_earliest_slot(
+                    temp_calendars, 
+                    attendees, 
+                    duration_mins, 
+                    priority, 
+                    search_start_time=search_start,
+                    max_preference_score=150  # Be more lenient for rescheduled meetings
+                )
+                
+                if result:
+                    new_slot, further_reschedules = result
+                    if not further_reschedules:  # Avoid cascading reschedules for simplicity
+                        rescheduled_meetings.append({
+                            'original_start': start,
+                            'original_end': end,
+                            'priority': priority,
+                            'summary': summary,
+                            'status': 'rescheduled',
+                            'new_start': new_slot[0],
+                            'new_end': new_slot[1],
+                            'duration_mins': duration_mins
+                        })
+                        print(f"    ✓ Rescheduled to: {new_slot[0].strftime('%Y-%m-%d %H:%M')} - {new_slot[1].strftime('%Y-%m-%d %H:%M')}")
+                    else:
+                        failed_reschedules.append({
+                            'original_start': start,
+                            'original_end': end,
+                            'priority': priority,
+                            'summary': summary,
+                            'status': 'failed_cascading_reschedule',
+                            'reason': 'Would require further reschedules'
+                        })
+                        print(f"    ✗ Could not reschedule '{summary}' - would require cascading reschedules")
+                else:
+                    failed_reschedules.append({
+                        'original_start': start,
+                        'original_end': end,
+                        'priority': priority,
+                        'summary': summary,
+                        'status': 'failed_no_slot',
+                        'reason': 'No available slot found'
+                    })
+                    print(f"    ✗ Could not find new slot for '{summary}'")
+                    
+            except Exception as e:
+                failed_reschedules.append({
+                    'original_start': start,
+                    'original_end': end,
+                    'priority': priority,
+                    'summary': summary,
+                    'status': 'failed_error',
+                    'reason': str(e)
+                })
+                print(f"    ✗ Error rescheduling '{summary}': {e}")
+        else:
+            # Fallback: Mark as needs manual rescheduling
+            failed_reschedules.append({
+                'original_start': start,
+                'original_end': end,
+                'priority': priority,
+                'summary': summary,
+                'status': 'needs_manual_rescheduling',
+                'reason': 'No calendar data provided for automatic rescheduling'
+            })
+            print(f"    ⚠ Needs manual rescheduling: '{summary}' (no calendar data provided)")
     
     print("--- END RESCHEDULING NOTIFICATION ---\n")
     
     return {
-        'action': 'reschedule_required',
-        'meetings_to_reschedule': rescheduled_meetings,
+        'action': 'reschedule_completed',
+        'rescheduled_meetings': rescheduled_meetings,
+        'failed_reschedules': failed_reschedules,
         'new_meeting': new_meeting_info
     }
 
@@ -448,7 +572,7 @@ def schedule_meeting_from_request(user_calendars, meeting_request):
         result = find_earliest_slot(parsed_calendars, attendees, duration_minutes, new_meeting_priority, search_start_time=desired_start_time)
         
         if result:
-            return _handle_successful_booking(result, meeting_request, new_meeting_priority)
+            return _handle_successful_booking(result, meeting_request, new_meeting_priority, parsed_calendars)
         
         # If primary approach fails, try fallback strategies
         print("\n=== ATTEMPTING FALLBACK STRATEGIES ===")
@@ -461,7 +585,7 @@ def schedule_meeting_from_request(user_calendars, meeting_request):
             
             if result:
                 print(f"SUCCESS: Found slot with shorter duration ({shorter_duration} minutes)")
-                return _handle_successful_booking(result, meeting_request, new_meeting_priority, fallback_used="shorter_duration")
+                return _handle_successful_booking(result, meeting_request, new_meeting_priority, parsed_calendars, fallback_used="shorter_duration")
         
         # Fallback 2: Try with majority attendees (if more than 2 attendees)
         if len(attendees) > 2:
@@ -472,7 +596,7 @@ def schedule_meeting_from_request(user_calendars, meeting_request):
             
             if result:
                 print(f"SUCCESS: Found slot with majority attendees")
-                return _handle_successful_booking(result, meeting_request, new_meeting_priority, fallback_used="majority_attendees", original_attendees=attendees)
+                return _handle_successful_booking(result, meeting_request, new_meeting_priority, parsed_calendars, fallback_used="majority_attendees", original_attendees=attendees)
         
         # Fallback 3: Try shifting time windows (±30 minutes, ±60 minutes)
         for shift_minutes in [30, -30, 60, -60]:
@@ -483,7 +607,7 @@ def schedule_meeting_from_request(user_calendars, meeting_request):
             
             if result:
                 print(f"SUCCESS: Found slot with shifted time window ({shift_minutes:+d} minutes)")
-                return _handle_successful_booking(result, meeting_request, new_meeting_priority, fallback_used="time_shift", shift_minutes=shift_minutes)
+                return _handle_successful_booking(result, meeting_request, new_meeting_priority, parsed_calendars, fallback_used="time_shift", shift_minutes=shift_minutes)
         
         # Fallback 4: Relax preference constraints (higher tolerance for violations)
         print(f"\nFallback 4: Relaxing preference constraints (allowing higher violation scores)")
@@ -492,7 +616,7 @@ def schedule_meeting_from_request(user_calendars, meeting_request):
         
         if result:
             print(f"SUCCESS: Found slot with relaxed preference constraints")
-            return _handle_successful_booking(result, meeting_request, new_meeting_priority, fallback_used="relaxed_preferences")
+            return _handle_successful_booking(result, meeting_request, new_meeting_priority, parsed_calendars, fallback_used="relaxed_preferences")
         
         print("\n=== ALL FALLBACK STRATEGIES FAILED ===")
         
@@ -508,9 +632,9 @@ def schedule_meeting_from_request(user_calendars, meeting_request):
     }
 
 
-def _handle_successful_booking(result, meeting_request, new_meeting_priority, fallback_used=None, **fallback_details):
+def _handle_successful_booking(result, meeting_request, new_meeting_priority, parsed_calendars=None, fallback_used=None, **fallback_details):
     """
-    Helper function to handle successful booking results.
+    Helper function to handle successful booking results and generate JSON output.
     """
     slot, to_reschedule = result
     
@@ -524,8 +648,26 @@ def _handle_successful_booking(result, meeting_request, new_meeting_priority, fa
             for key, value in fallback_details.items():
                 print(f"    {key}: {value}")
     
+    # Prepare the main meeting JSON
+    duration_mins = int((slot[1] - slot[0]).total_seconds() / 60)
+    main_meeting_json = format_meeting_to_json(
+        subject=meeting_request.get('Subject', 'Unknown Meeting'),
+        email_content=meeting_request.get('EmailContent', f"Meeting scheduled for {meeting_request.get('Subject', 'Unknown Meeting')}"),
+        start_time=slot[0],
+        end_time=slot[1],
+        duration_mins=duration_mins,
+        metadata={
+            'priority': new_meeting_priority,
+            'fallback_used': fallback_used,
+            'rescheduling_required': bool(to_reschedule)
+        }
+    )
+    
+    meetings_json = [main_meeting_json]
+    rescheduling_result = None
+    
     if to_reschedule:
-        # Call requirewna function to handle rescheduling
+        # Call requirewna function to handle rescheduling with calendar data
         meeting_info = {
             'subject': meeting_request.get('Subject', 'Unknown'),
             'start_time': slot[0],
@@ -534,10 +676,28 @@ def _handle_successful_booking(result, meeting_request, new_meeting_priority, fa
         }
         
         try:
-            rescheduling_result = requirewna(to_reschedule, meeting_info)
+            rescheduling_result = requirewna(to_reschedule, meeting_info, parsed_calendars)
             print(f"\nNOTE: This time requires {len(to_reschedule)} lower-priority meeting(s) to be rescheduled:")
             for _, _, p, s in to_reschedule:
                 print(f"  - (P{p}) '{s}'")
+            
+            # Add rescheduled meetings to JSON output
+            for rescheduled in rescheduling_result.get('rescheduled_meetings', []):
+                if rescheduled['status'] == 'rescheduled':
+                    rescheduled_json = format_meeting_to_json(
+                        subject=rescheduled['summary'],
+                        email_content=f"Rescheduled meeting: {rescheduled['summary']}",
+                        start_time=rescheduled['new_start'],
+                        end_time=rescheduled['new_end'],
+                        duration_mins=rescheduled['duration_mins'],
+                        metadata={
+                            'priority': rescheduled['priority'],
+                            'rescheduled': True,
+                            'original_start': rescheduled['original_start'].isoformat(),
+                            'original_end': rescheduled['original_end'].isoformat()
+                        }
+                    )
+                    meetings_json.append(rescheduled_json)
             
             return {
                 'success': True,
@@ -545,17 +705,19 @@ def _handle_successful_booking(result, meeting_request, new_meeting_priority, fa
                 'rescheduling_required': True,
                 'rescheduling_result': rescheduling_result,
                 'fallback_used': fallback_used,
-                'fallback_details': fallback_details
+                'fallback_details': fallback_details,
+                'meetings_json': meetings_json
             }
         except Exception as e:
-            print(f"Warning: Rescheduling notification failed. Details: {e}")
+            print(f"Warning: Rescheduling failed. Details: {e}")
             return {
                 'success': True,
                 'slot': slot,
                 'rescheduling_required': True,
                 'rescheduling_result': None,
                 'fallback_used': fallback_used,
-                'fallback_details': fallback_details
+                'fallback_details': fallback_details,
+                'meetings_json': meetings_json
             }
     else:
         print("\nThis is a free slot, no rescheduling needed.")
@@ -564,7 +726,8 @@ def _handle_successful_booking(result, meeting_request, new_meeting_priority, fa
             'slot': slot,
             'rescheduling_required': False,
             'fallback_used': fallback_used,
-            'fallback_details': fallback_details
+            'fallback_details': fallback_details,
+            'meetings_json': meetings_json
         }
 
 
@@ -594,5 +757,12 @@ if __name__ == "__main__":
     }
     
     print("\n" + "="*50 + "\n")
-    schedule_meeting_from_request(USER_CALENDARS_INPUT, MEETING_REQUEST_INPUT)
+    result = schedule_meeting_from_request(USER_CALENDARS_INPUT, MEETING_REQUEST_INPUT)
+    
+    # Print JSON output if available
+    if result and result.get('meetings_json'):
+        print("\n" + "="*20 + " JSON OUTPUT " + "="*20)
+        print(json.dumps(result['meetings_json'], indent=2))
+        print("="*52)
+    
     print("\n" + "="*50 + "\n")
