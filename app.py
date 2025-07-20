@@ -1119,8 +1119,69 @@ def find_earliest_slot(calendars, attendees, duration_minutes, new_meeting_prior
 
 def schedule_meeting_from_request(user_calendars, meeting_request):
     """
-    High-level function to handle scheduling based on a specific request format.
-    Includes fallback strategies for when initial scheduling fails.
+    High-level orchestrator function for meeting scheduling with comprehensive fallback strategies.
+    
+    This is the main entry point for the scheduling system. It coordinates the entire scheduling
+    process from request validation through calendar analysis to conflict resolution. When the
+    primary scheduling approach fails, it systematically tries multiple fallback strategies to
+    maximize the chances of successful meeting placement.
+    
+    Args:
+        user_calendars (dict): Calendar data for all users involved
+            Format: {user_id: [list_of_calendar_events]}
+        meeting_request (dict): Structured meeting request containing:
+            - Subject: Meeting title
+            - start time: Desired start time in 'DD-MM-YYYYTHH:MM:SS' format
+            - Duration of meeting: Meeting duration in minutes
+            - Priority: Meeting priority (1=highest to 4=lowest)
+    
+    Returns:
+        dict or None: Scheduling result containing:
+            - success: Boolean indicating overall success
+            - meetings: List of meeting objects in JSON format
+            - rescheduling_required: Boolean indicating if conflicts were resolved
+            - fallback_used: String indicating which fallback strategy succeeded (if any)
+            - fallback_details: Additional details about fallback application
+            Returns None if all scheduling attempts fail
+    
+    Scheduling Strategy:
+        1. **Primary Attempt**: Try exact meeting requirements
+        2. **Fallback 1**: Reduce duration to 75% (minimum 15 minutes)
+        3. **Fallback 2**: Schedule with majority attendees only (if >2 people)
+        4. **Fallback 3**: Try time shifts (±30, ±60 minutes from desired time)
+        5. **Fallback 4**: Relax preference constraints (higher violation tolerance)
+    
+    Error Handling:
+        - Validates all input parameters with detailed error messages
+        - Gracefully handles calendar parsing failures
+        - Provides fallback to empty calendars if no valid events found
+        - Returns comprehensive error information for debugging
+    
+    Process Flow:
+        1. Input validation (calendars, meeting request format)
+        2. Parse meeting details (duration, start time, priority, attendees)
+        3. Parse and validate calendar data
+        4. Attempt primary scheduling using find_earliest_slot()
+        5. If failed, systematically try fallback strategies
+        6. Handle successful booking through _handle_successful_booking()
+        7. Return structured result or None if all attempts fail
+    
+    Example:
+        >>> calendars = {"user1": [...], "user2": [...]}
+        >>> request = {
+        ...     "Subject": "Team Meeting",
+        ...     "start time ": "24-07-2025T10:00:00",
+        ...     "Duration of meeting": 60,
+        ...     "Priority": 2
+        ... }
+        >>> result = schedule_meeting_from_request(calendars, request)
+        >>> if result['success']:
+        ...     print(f"Meeting scheduled: {result['meetings'][0]['EventStart']}")
+    
+    Note:
+        - Prints detailed progress information for monitoring and debugging
+        - Optimized for the specific JSON format expected by the AMD AI Hackathon
+        - Handles timezone considerations (assumes IST +05:30)
     """
     print(f"--- Received new meeting request: '{meeting_request.get('Subject', 'No Subject')}' ---")
     
@@ -1335,43 +1396,138 @@ def _handle_successful_booking(result, meeting_request, new_meeting_priority, pa
         }
 
 
+# ================================================================================================
+# DATA FORMAT CONVERSION UTILITIES
+# ================================================================================================
+
 def akshay_input_format(request_data):
-    details,summary = extract_meeting_details_with_llm(
+    """
+    Convert external API request format to internal scheduling system format.
+    
+    This function serves as the main data transformation pipeline that bridges the
+    external API format (AMD AI Hackathon specification) with the internal scheduling
+    system requirements. It combines LLM-based natural language processing with
+    calendar data retrieval to create the structured input needed for scheduling.
+    
+    Args:
+        request_data (dict): Original API request containing:
+            - EmailContent: Natural language meeting request
+            - Datetime: Reference datetime for relative time resolution
+            - From: Organizer email address
+            - Attendees: List of attendee objects with email addresses
+            - Other fields (Request_id, Location, Subject, etc.)
+    
+    Returns:
+        tuple: Two-element tuple containing:
+            - new_input_format (dict): Structured meeting request with:
+                * start time: Parsed start datetime string
+                * Duration of meeting: Meeting duration in minutes
+                * Subject: Extracted meeting title/summary
+                * Priority: Assigned priority level (1-4)
+                * All original fields from request_data
+            - personal_slots (dict): Retrieved calendar data with:
+                * Format: {user_id: [list_of_calendar_events]}
+                * Covers the time window from parsed start to end dates
+    
+    Process Flow:
+        1. **LLM Processing**: Use extract_meeting_details_with_llm() to parse EmailContent
+           - Converts natural language to structured data
+           - Resolves relative time expressions ("tomorrow", "next week")
+           - Extracts duration, priority, and meeting summary
+        
+        2. **Time Window Calculation**: Determine calendar lookup window
+           - Parse start_date and end_date from LLM output
+           - Convert to datetime objects with IST timezone
+           - Create search window for calendar retrieval
+        
+        3. **Meeting Request Formatting**: Create internal meeting request
+           - Copy original request data
+           - Add parsed start time, duration, subject, priority
+           - Format for consumption by scheduling algorithms
+        
+        4. **Calendar Data Retrieval**: Fetch calendar events for all attendees
+           - Extract all email addresses (organizer + attendees)
+           - Map emails to internal user IDs using hardcoded mapping
+           - Retrieve calendar events for the determined time window
+           - Return as personal_slots dictionary
+    
+    User Mapping:
+        The function uses a hardcoded mapping for the hackathon environment:
+        - 'userone.amd@gmail.com' → 'user1'
+        - 'usertwo.amd@gmail.com' → 'user2'  
+        - 'userthree.amd@gmail.com' → 'user3'
+        - Unknown emails → 'userk' (generic fallback)
+    
+    Example:
+        >>> request = {
+        ...     "EmailContent": "Let's meet tomorrow for 1 hour",
+        ...     "Datetime": "19-07-2025T12:34:55",
+        ...     "From": "userone.amd@gmail.com",
+        ...     "Attendees": [{"email": "usertwo.amd@gmail.com"}]
+        ... }
+        >>> meeting_format, calendars = akshay_input_format(request)
+        >>> print(meeting_format["Duration of meeting"])  # 60
+        >>> print(len(calendars))  # 2 (organizer + 1 attendee)
+    
+    Note:
+        - Assumes IST timezone (+05:30) for all datetime operations
+        - Uses retrive_calendar_events() for Google Calendar integration
+        - Handles LLM parsing errors gracefully with fallback values
+        - Calendar retrieval errors are handled by the calling functions
+    """
+    # ===== STEP 1: LLM PROCESSING =====
+    # Use LLM to parse the natural language meeting request
+    details, summary = extract_meeting_details_with_llm(
         request_data["EmailContent"], 
         request_data["Datetime"]
     )
-    #print('LLM REsponse', details)
+    # The LLM returns structured meeting details including timing and priority
     
+    # Extract key timing information from LLM response
     start_date, end_date, duration_minutes = details['start_date'], details['end_date'], details['duration_minutes']
     meeting_duration = timedelta(minutes=duration_minutes)
 
-    # 2. Determine the search window for the meeting
+    # ===== STEP 2: TIME WINDOW CALCULATION =====
+    # Convert LLM-parsed date strings to datetime objects for calendar lookup
     from datetime import datetime
     start_dt = datetime.strptime(start_date, "%d-%m-%YT%H:%M:%S")
     end_dt = datetime.strptime(end_date, "%d-%m-%YT%H:%M:%S")
     
+    # ===== STEP 3: MEETING REQUEST FORMATTING =====
+    # Create internal meeting request format by copying original and adding parsed fields
     new_input_format = request_data.copy()
-    new_input_format["start time "] = start_dt.strftime("%d-%m-%YT%H:%M:%S")
-    new_input_format["Duration of meeting"] =  duration_minutes
-    new_input_format["Subject"] =  summary
-    new_input_format["Priority"] =  details['priority']
+    new_input_format["start time "] = start_dt.strftime("%d-%m-%YT%H:%M:%S")  # Formatted start time
+    new_input_format["Duration of meeting"] = duration_minutes              # Duration in minutes
+    new_input_format["Subject"] = summary                                   # LLM-extracted summary
+    new_input_format["Priority"] = details['priority']                      # LLM-assigned priority
 
+    # ===== STEP 4: CALENDAR DATA RETRIEVAL =====
+    # Setup timezone for calendar operations (IST +05:30)
     ist_tz = timezone(timedelta(hours=5, minutes=30))
-    day_start_utc = start_dt.replace(tzinfo=ist_tz)
-    day_end_utc = end_dt.replace(tzinfo=ist_tz)
-    # day_end_utc = day_start_utc + timedelta(hours=24)
+    day_start_utc = start_dt.replace(tzinfo=ist_tz)  # Start of search window
+    day_end_utc = end_dt.replace(tzinfo=ist_tz)      # End of search window
     
+    # Extract all email addresses involved in the meeting
     all_emails = [request_data["From"]] + [p["email"] for p in request_data["Attendees"]]
-    mappings = {'userone.amd@gmail.com': 'user1', 'usertwo.amd@gmail.com': 'user2', 'userthree.amd@gmail.com': 'user3'}
     
+    # Hardcoded email-to-user mapping for the hackathon environment
+    mappings = {
+        'userone.amd@gmail.com': 'user1', 
+        'usertwo.amd@gmail.com': 'user2', 
+        'userthree.amd@gmail.com': 'user3'
+    }
+    
+    # Retrieve calendar events for each attendee within the time window
     personal_slots = {}
     for email in all_emails:
         calendar_events = retrive_calendar_events(
-            email, 
-            day_start_utc.isoformat(), 
-            day_end_utc.isoformat()
+            email,                        # User email for calendar access
+            day_start_utc.isoformat(),   # ISO format start time
+            day_end_utc.isoformat()      # ISO format end time
         )
-        personal_slots[mappings.get(email,'userk')] = calendar_events
+        # Map email to internal user ID, with fallback for unknown emails
+        user_id = mappings.get(email, 'userk')
+        personal_slots[user_id] = calendar_events
         
     return new_input_format, personal_slots
 
@@ -1444,46 +1600,154 @@ def output_format_parser(input_request, output_request):
 
 
 
+# ================================================================================================
+# LANGGRAPH WORKFLOW ORCHESTRATION
+# ================================================================================================
+
 from typing_extensions import TypedDict
 from typing import Dict
 
 class State(TypedDict):
+    """
+    State schema for the LangGraph workflow.
+    
+    This TypedDict defines the data structure that flows through the scheduling workflow.
+    Each stage of the workflow reads from and writes to specific fields in this state.
+    
+    Attributes:
+        user_request (Dict): Original JSON request from the API
+        meeting_request_input (Dict): Parsed and formatted meeting request
+        user_calendars_input (Dict): Retrieved and processed calendar data
+        scheduled_meeting (Dict): Result from the scheduling algorithm
+        final_output (Dict): Final formatted response for the API
+    """
     user_request: Dict
     meeting_request_input: Dict
     user_calendars_input: Dict
     scheduled_meeting: Dict
     final_output: Dict
 
-# %%
 from langgraph.graph import StateGraph
 
+# Initialize the LangGraph state machine for the scheduling workflow
 builder = StateGraph(State)
 
 def parsing_user_request(state: State):
-    #print('HERE')
+    """
+    Parse and transform the incoming user request into internal formats.
+    
+    This is the first step in the scheduling workflow. It takes the raw JSON request
+    and performs two key transformations:
+    1. Extracts meeting details using LLM (natural language → structured data)
+    2. Retrieves calendar data for all attendees from Google Calendar API
+    
+    Args:
+        state (State): Current workflow state containing user_request
+    
+    Returns:
+        dict: Updated state fields:
+            - meeting_request_input: Formatted meeting request with parsed details
+            - user_calendars_input: Retrieved calendar data for all attendees
+    
+    Process:
+        1. Call akshay_input_format() with the user request
+        2. LLM parses the EmailContent to extract meeting details
+        3. Calendar events are retrieved for all attendees
+        4. Data is formatted for the scheduling algorithm
+    
+    Note:
+        This function acts as the bridge between the external API format
+        and the internal scheduling system format.
+    """
     MEETING_REQUEST_INPUT, USER_CALENDARS_INPUT = akshay_input_format(state['user_request'])
     return {"meeting_request_input": MEETING_REQUEST_INPUT, "user_calendars_input": USER_CALENDARS_INPUT}
 
-# The second argument is optional
 def meeting_scheduler(state: State):
-    #print(state)
+    """
+    Execute the core meeting scheduling algorithm.
+    
+    This is the central processing step that takes the parsed meeting request and
+    calendar data, then runs the intelligent scheduling algorithm to find the
+    optimal meeting time. Includes conflict resolution and fallback strategies.
+    
+    Args:
+        state (State): Current workflow state with meeting_request_input and user_calendars_input
+    
+    Returns:
+        dict: Updated state field:
+            - scheduled_meeting: Result from the scheduling algorithm including:
+                * success status
+                * scheduled meeting details
+                * any rescheduled meetings
+                * fallback information
+    
+    Process:
+        1. Delegates to schedule_meeting_from_request()
+        2. Applies two-phase scheduling algorithm (free slots → reschedulable slots)
+        3. Handles conflict resolution and recursive rescheduling
+        4. Tries fallback strategies if initial scheduling fails
+        5. Returns comprehensive scheduling result
+    
+    Note:
+        This is where all the complex scheduling logic happens, including
+        priority-based conflict resolution and preference scoring.
+    """
     scheduled_meeting = schedule_meeting_from_request(state['user_calendars_input'], state['meeting_request_input'])
     return {"scheduled_meeting": scheduled_meeting}
 
 def convert_output(state: State):
-    final_output=  output_format_parser(state["meeting_request_input"], state["scheduled_meeting"])
-    return {"final_output": final_output}
+    """
+    Convert the internal scheduling result to the required API response format.
     
+    This is the final step that transforms the internal scheduling result into
+    the specific JSON format required by the AMD AI Hackathon evaluation system.
+    It ensures the response includes all required fields and follows the exact
+    specification.
+    
+    Args:
+        state (State): Current workflow state with meeting_request_input and scheduled_meeting
+    
+    Returns:
+        dict: Updated state field:
+            - final_output: Complete API response in the required format including:
+                * All original request fields
+                * Scheduled meeting details
+                * Updated calendar events for all attendees
+                * Metadata about the scheduling process
+    
+    Process:
+        1. Calls output_format_parser() to format the response
+        2. Merges the scheduled meeting with existing calendar events
+        3. Updates all attendees' event lists
+        4. Ensures compliance with the API specification
+        5. Handles rescheduled meetings properly
+    
+    Note:
+        This function ensures the response format exactly matches the
+        expected JSON structure for evaluation and grading.
+    """
+    final_output = output_format_parser(state["meeting_request_input"], state["scheduled_meeting"])
+    return {"final_output": final_output}
+
+# ===== WORKFLOW GRAPH CONSTRUCTION =====
+# Build the LangGraph workflow by adding nodes and defining the execution sequence
+
+# Add the three main processing steps as nodes
 builder.add_node(parsing_user_request)
 builder.add_node(meeting_scheduler)
 builder.add_node(convert_output)
 
 from langgraph.graph import START, END
 
-builder.add_edge(START, "parsing_user_request")
-builder.add_edge("parsing_user_request", "meeting_scheduler")
-builder.add_edge("meeting_scheduler", "convert_output")
-builder.add_edge("convert_output", END)
+# Define the linear workflow execution sequence
+# Each step depends on the output of the previous step
+builder.add_edge(START, "parsing_user_request")      # Entry point
+builder.add_edge("parsing_user_request", "meeting_scheduler")  # Parse → Schedule
+builder.add_edge("meeting_scheduler", "convert_output")        # Schedule → Format
+builder.add_edge("convert_output", END)                        # Format → Exit
+
+# The workflow graph is now ready for compilation and execution
+# Usage: graph = builder.compile(); result = graph.invoke({"user_request": data})
 
 
 
