@@ -136,6 +136,188 @@ def requirewna(meetings_to_reschedule, new_meeting_info):
         'new_meeting': new_meeting_info
     }
 
+
+def reschedule_with_recurrence(calendars, meetings_to_reschedule, recurrence_details):
+    """
+    Reschedule meetings considering recurrence patterns.
+    
+    Args:
+        calendars (dict): Current calendar data
+        meetings_to_reschedule (list): List of meetings that need rescheduling
+        recurrence_details (dict): Recurrence information including pattern, frequency, etc.
+    
+    Returns:
+        list: List of new scheduling suggestions for the meetings
+    """
+    if not recurrence_details:
+        return []
+    
+    print(f"\n--- RECURRENCE-BASED RESCHEDULING ---")
+    print(f"Pattern: {recurrence_details.get('pattern', 'none')}")
+    print(f"Frequency: {recurrence_details.get('frequency', 'none')}")
+    
+    reschedule_suggestions = []
+    
+    for meeting in meetings_to_reschedule:
+        start, end, priority, summary = meeting
+        duration = int((end - start).total_seconds() / 60)  # Duration in minutes
+        
+        # Extract attendees from the meeting - simplified approach
+        attendees = list(calendars.keys())  # Use all available users as fallback
+        
+        # Try to find new slots based on recurrence pattern
+        if recurrence_details.get('pattern') == 'weekly':
+            # For weekly recurrence, try next week same time
+            search_start = start + datetime.timedelta(weeks=1)
+        elif recurrence_details.get('pattern') == 'daily':
+            # For daily recurrence, try next day same time
+            search_start = start + datetime.timedelta(days=1)
+        elif recurrence_details.get('pattern') == 'monthly':
+            # For monthly recurrence, try next month same time
+            search_start = start + datetime.timedelta(days=30)
+        else:
+            # Default: try 1 hour later
+            search_start = start + datetime.timedelta(hours=1)
+        
+        # Create a clean calendar without the conflicting meetings for rescheduling
+        clean_calendars = {}
+        for user_id in attendees:
+            if user_id in calendars:
+                # Filter out meetings that are being rescheduled
+                user_events = []
+                for event_tuple in calendars[user_id]:
+                    if isinstance(event_tuple, tuple) and len(event_tuple) >= 4:
+                        event_start, event_end, event_priority, event_summary = event_tuple
+                        # Skip the meetings that are being rescheduled
+                        if not (event_start == start and event_end == end and event_summary == summary):
+                            user_events.append(event_tuple)
+                clean_calendars[user_id] = user_events
+            else:
+                clean_calendars[user_id] = []
+        
+        # Find new slot for this meeting
+        try:
+            result = find_earliest_slot(
+                clean_calendars, attendees, duration, priority, 
+                search_start_time=search_start,
+                recurrence_details=recurrence_details
+            )
+            
+            if result:
+                new_slot, _ = result
+                reschedule_suggestions.append({
+                    'original_meeting': {
+                        'start': start,
+                        'end': end,
+                        'priority': priority,
+                        'summary': summary
+                    },
+                    'new_slot': {
+                        'start': new_slot[0],
+                        'end': new_slot[1]
+                    },
+                    'status': 'rescheduled'
+                })
+                print(f"  Rescheduled '{summary}' to {new_slot[0].strftime('%Y-%m-%d %H:%M')} - {new_slot[1].strftime('%Y-%m-%d %H:%M')}")
+            else:
+                reschedule_suggestions.append({
+                    'original_meeting': {
+                        'start': start,
+                        'end': end,
+                        'priority': priority,
+                        'summary': summary
+                    },
+                    'new_slot': None,
+                    'status': 'could_not_reschedule'
+                })
+                print(f"  Could not reschedule '{summary}'")
+        except Exception as e:
+            print(f"  Error rescheduling '{summary}': {e}")
+            reschedule_suggestions.append({
+                'original_meeting': {
+                    'start': start,
+                    'end': end,
+                    'priority': priority,
+                    'summary': summary
+                },
+                'new_slot': None,
+                'status': 'error_rescheduling',
+                'error': str(e)
+            })
+    
+    print("--- END RECURRENCE-BASED RESCHEDULING ---\n")
+    return reschedule_suggestions
+
+
+def format_scheduling_output(result, meeting_request, recurrence_details=None):
+    """
+    Format the scheduling result into the required JSON output format.
+    
+    Args:
+        result (dict): Result from schedule_meeting_from_request
+        meeting_request (dict): Original meeting request
+        recurrence_details (dict, optional): Recurrence information
+    
+    Returns:
+        dict: Formatted JSON output
+    """
+    if not result or not result.get('success'):
+        return {
+            "Subject": meeting_request.get('Subject', ''),
+            "EmailContent": meeting_request.get('EmailContent', ''),
+            "EventStart": None,
+            "EventEnd": None,
+            "Duration_mins": None,
+            "MetaData": {
+                "success": False,
+                "error": result.get('error', 'Scheduling failed') if result else 'No result',
+                "recurrence_details": recurrence_details or {}
+            }
+        }
+    
+    slot = result['slot']
+    start_time = slot[0]
+    end_time = slot[1]
+    duration_mins = str(int((end_time - start_time).total_seconds() / 60))
+    
+    # Prepare metadata
+    metadata = {
+        "success": True,
+        "rescheduling_required": result.get('rescheduling_required', False),
+        "fallback_used": result.get('fallback_used'),
+        "recurrence_details": recurrence_details or {}
+    }
+    
+    # Add rescheduling information if applicable
+    if result.get('rescheduling_required') and result.get('rescheduling_result'):
+        rescheduled_meetings = result['rescheduling_result'].get('meetings_to_reschedule', [])
+        # Convert datetime objects to ISO format strings for JSON serialization
+        json_safe_meetings = []
+        for meeting in rescheduled_meetings:
+            json_safe_meeting = {
+                'original_start': meeting['original_start'].isoformat() if hasattr(meeting['original_start'], 'isoformat') else str(meeting['original_start']),
+                'original_end': meeting['original_end'].isoformat() if hasattr(meeting['original_end'], 'isoformat') else str(meeting['original_end']),
+                'priority': meeting['priority'],
+                'summary': meeting['summary'],
+                'status': meeting['status']
+            }
+            json_safe_meetings.append(json_safe_meeting)
+        
+        metadata["rescheduled_meetings"] = json_safe_meetings
+        
+        # If recurrence details are provided, add note about recurrence-based rescheduling
+        if recurrence_details:
+            metadata["recurrence_reschedule_note"] = "Recurrence-based rescheduling would be applied to conflicted meetings based on the specified pattern"
+    
+    return {
+        "Subject": meeting_request.get('Subject', ''),
+        "EmailContent": meeting_request.get('EmailContent', ''),
+        "EventStart": start_time.isoformat(),
+        "EventEnd": end_time.isoformat(),
+        "Duration_mins": duration_mins,
+        "MetaData": metadata
+    }
+
 def parse_calendar_data(raw_events):
     """
     Parses a list of event dictionaries, including priority, and converts it
@@ -215,7 +397,7 @@ def parse_calendar_data(raw_events):
             
     return dict(parsed_calendars)
 
-def find_earliest_slot(calendars, attendees, duration_minutes, new_meeting_priority, search_start_time=None, max_preference_score=100):
+def find_earliest_slot(calendars, attendees, duration_minutes, new_meeting_priority, search_start_time=None, max_preference_score=100, recurrence_details=None):
     """
     Finds the earliest possible time slot, considering meeting priorities and participant preferences.
 
@@ -230,6 +412,8 @@ def find_earliest_slot(calendars, attendees, duration_minutes, new_meeting_prior
         new_meeting_priority (int): The priority of the meeting to be scheduled.
         search_start_time (datetime.datetime, optional): The time to start searching from.
         max_preference_score (int): Maximum acceptable preference violation score.
+        recurrence_details (dict, optional): Recurrence information for rescheduling meetings.
+                                           Should include 'pattern', 'frequency', 'end_date', etc.
 
     Returns:
         tuple or None: A tuple of ( (start_time, end_time), list_of_meetings_to_reschedule ).
@@ -266,6 +450,12 @@ def find_earliest_slot(calendars, attendees, duration_minutes, new_meeting_prior
         search_start_time = search_start_time.replace(hour=earliest_start_hour, minute=0, second=0, microsecond=0)
     
     print(f"  Working hours constraint: {earliest_start_hour}:00 - {latest_end_hour}:00")
+    
+    # Handle recurrence details if provided
+    if recurrence_details:
+        print(f"  Recurrence details provided: {recurrence_details.get('pattern', 'none')}")
+        # For rescheduling with recurrence, we may need to consider multiple time slots
+        # This will be used in the reschedule logic to find optimal slots
     
     # 1. Aggregate all busy slots from all attendees.
     all_busy_slots = []
@@ -365,10 +555,18 @@ def find_earliest_slot(calendars, attendees, duration_minutes, new_meeting_prior
     return None # No free or reschedulable slot found.
 
 
-def schedule_meeting_from_request(user_calendars, meeting_request):
+def schedule_meeting_from_request(user_calendars, meeting_request, recurrence_details=None):
     """
     High-level function to handle scheduling based on a specific request format.
     Includes fallback strategies for when initial scheduling fails.
+    
+    Args:
+        user_calendars (dict): Calendar data for all users
+        meeting_request (dict): Meeting request details  
+        recurrence_details (dict, optional): Recurrence information for rescheduling
+    
+    Returns:
+        dict: Scheduling result with enhanced metadata
     """
     print(f"--- Received new meeting request: '{meeting_request.get('Subject', 'No Subject')}' ---")
     
@@ -445,10 +643,11 @@ def schedule_meeting_from_request(user_calendars, meeting_request):
 
     # Try primary scheduling approach
     try:
-        result = find_earliest_slot(parsed_calendars, attendees, duration_minutes, new_meeting_priority, search_start_time=desired_start_time)
+        result = find_earliest_slot(parsed_calendars, attendees, duration_minutes, new_meeting_priority, 
+                                  search_start_time=desired_start_time, recurrence_details=recurrence_details)
         
         if result:
-            return _handle_successful_booking(result, meeting_request, new_meeting_priority)
+            return _handle_successful_booking(result, meeting_request, new_meeting_priority, parsed_calendars, recurrence_details)
         
         # If primary approach fails, try fallback strategies
         print("\n=== ATTEMPTING FALLBACK STRATEGIES ===")
@@ -457,42 +656,50 @@ def schedule_meeting_from_request(user_calendars, meeting_request):
         shorter_duration = int(duration_minutes * 0.75)
         if shorter_duration >= 15:  # Minimum 15 minutes
             print(f"\nFallback 1: Trying shorter duration ({shorter_duration} minutes instead of {duration_minutes})")
-            result = find_earliest_slot(parsed_calendars, attendees, shorter_duration, new_meeting_priority, search_start_time=desired_start_time)
+            result = find_earliest_slot(parsed_calendars, attendees, shorter_duration, new_meeting_priority, 
+                                      search_start_time=desired_start_time, recurrence_details=recurrence_details)
             
             if result:
                 print(f"SUCCESS: Found slot with shorter duration ({shorter_duration} minutes)")
-                return _handle_successful_booking(result, meeting_request, new_meeting_priority, fallback_used="shorter_duration")
+                return _handle_successful_booking(result, meeting_request, new_meeting_priority, parsed_calendars, 
+                                                recurrence_details, fallback_used="shorter_duration")
         
         # Fallback 2: Try with majority attendees (if more than 2 attendees)
         if len(attendees) > 2:
             majority_attendees = attendees[:len(attendees)//2 + 1]  # Take majority
             print(f"\nFallback 2: Trying with majority attendees ({', '.join(majority_attendees)} out of {', '.join(attendees)})")
             
-            result = find_earliest_slot(parsed_calendars, majority_attendees, duration_minutes, new_meeting_priority, search_start_time=desired_start_time)
+            result = find_earliest_slot(parsed_calendars, majority_attendees, duration_minutes, new_meeting_priority, 
+                                      search_start_time=desired_start_time, recurrence_details=recurrence_details)
             
             if result:
                 print(f"SUCCESS: Found slot with majority attendees")
-                return _handle_successful_booking(result, meeting_request, new_meeting_priority, fallback_used="majority_attendees", original_attendees=attendees)
+                return _handle_successful_booking(result, meeting_request, new_meeting_priority, parsed_calendars,
+                                                recurrence_details, fallback_used="majority_attendees", original_attendees=attendees)
         
         # Fallback 3: Try shifting time windows (±30 minutes, ±60 minutes)
         for shift_minutes in [30, -30, 60, -60]:
             shifted_start = desired_start_time + datetime.timedelta(minutes=shift_minutes)
             print(f"\nFallback 3: Trying shifted time window ({shift_minutes:+d} minutes -> {shifted_start.strftime('%H:%M')})")
             
-            result = find_earliest_slot(parsed_calendars, attendees, duration_minutes, new_meeting_priority, search_start_time=shifted_start)
+            result = find_earliest_slot(parsed_calendars, attendees, duration_minutes, new_meeting_priority, 
+                                      search_start_time=shifted_start, recurrence_details=recurrence_details)
             
             if result:
                 print(f"SUCCESS: Found slot with shifted time window ({shift_minutes:+d} minutes)")
-                return _handle_successful_booking(result, meeting_request, new_meeting_priority, fallback_used="time_shift", shift_minutes=shift_minutes)
+                return _handle_successful_booking(result, meeting_request, new_meeting_priority, parsed_calendars,
+                                                recurrence_details, fallback_used="time_shift", shift_minutes=shift_minutes)
         
         # Fallback 4: Relax preference constraints (higher tolerance for violations)
         print(f"\nFallback 4: Relaxing preference constraints (allowing higher violation scores)")
         result = find_earliest_slot(parsed_calendars, attendees, duration_minutes, new_meeting_priority, 
-                                  search_start_time=desired_start_time, max_preference_score=200)
+                                  search_start_time=desired_start_time, max_preference_score=200, 
+                                  recurrence_details=recurrence_details)
         
         if result:
             print(f"SUCCESS: Found slot with relaxed preference constraints")
-            return _handle_successful_booking(result, meeting_request, new_meeting_priority, fallback_used="relaxed_preferences")
+            return _handle_successful_booking(result, meeting_request, new_meeting_priority, parsed_calendars,
+                                            recurrence_details, fallback_used="relaxed_preferences")
         
         print("\n=== ALL FALLBACK STRATEGIES FAILED ===")
         
@@ -508,7 +715,7 @@ def schedule_meeting_from_request(user_calendars, meeting_request):
     }
 
 
-def _handle_successful_booking(result, meeting_request, new_meeting_priority, fallback_used=None, **fallback_details):
+def _handle_successful_booking(result, meeting_request, new_meeting_priority, calendars=None, recurrence_details=None, fallback_used=None, **fallback_details):
     """
     Helper function to handle successful booking results.
     """
@@ -539,13 +746,19 @@ def _handle_successful_booking(result, meeting_request, new_meeting_priority, fa
             for _, _, p, s in to_reschedule:
                 print(f"  - (P{p}) '{s}'")
             
+            # If recurrence details are provided, generate reschedule suggestions
+            if recurrence_details and calendars:
+                reschedule_suggestions = reschedule_with_recurrence(calendars, to_reschedule, recurrence_details)
+                rescheduling_result['recurrence_reschedule_suggestions'] = reschedule_suggestions
+            
             return {
                 'success': True,
                 'slot': slot,
                 'rescheduling_required': True,
                 'rescheduling_result': rescheduling_result,
                 'fallback_used': fallback_used,
-                'fallback_details': fallback_details
+                'fallback_details': fallback_details,
+                'recurrence_details': recurrence_details
             }
         except Exception as e:
             print(f"Warning: Rescheduling notification failed. Details: {e}")
@@ -555,7 +768,8 @@ def _handle_successful_booking(result, meeting_request, new_meeting_priority, fa
                 'rescheduling_required': True,
                 'rescheduling_result': None,
                 'fallback_used': fallback_used,
-                'fallback_details': fallback_details
+                'fallback_details': fallback_details,
+                'recurrence_details': recurrence_details
             }
     else:
         print("\nThis is a free slot, no rescheduling needed.")
@@ -564,7 +778,70 @@ def _handle_successful_booking(result, meeting_request, new_meeting_priority, fa
             'slot': slot,
             'rescheduling_required': False,
             'fallback_used': fallback_used,
-            'fallback_details': fallback_details
+            'fallback_details': fallback_details,
+            'recurrence_details': recurrence_details
+        }
+
+
+def schedule_meeting_with_json_output(input_request, user_calendars=None, recurrence_details=None):
+    """
+    Main entry function that accepts the new JSON input format and returns the required JSON output.
+    
+    Args:
+        input_request (dict): Input request in the format from JSON_Samples/Input_Request.json
+        user_calendars (dict, optional): User calendar data. If None, will use sample data.
+        recurrence_details (dict, optional): Recurrence information for rescheduling
+    
+    Returns:
+        dict: JSON output in the required format
+    """
+    
+    # Convert input format to the format expected by schedule_meeting_from_request
+    try:
+        # Extract duration from EmailContent using basic parsing
+        email_content = input_request.get('EmailContent', '')
+        duration_minutes = 60  # Default duration
+        
+        # Simple duration extraction from email content
+        import re
+        duration_match = re.search(r'(\d+)\s*minutes?', email_content, re.IGNORECASE)
+        if duration_match:
+            duration_minutes = int(duration_match.group(1))
+        
+        # Convert to internal meeting request format
+        meeting_request = {
+            "start time ": input_request.get('Datetime', ''),
+            "Duration of meeting": f"{duration_minutes} min",
+            "Subject": input_request.get('Subject', ''),
+            "EmailContent": input_request.get('EmailContent', ''),
+            "Priority": 3  # Default priority, could be derived from Subject keywords
+        }
+        
+        # Use provided user_calendars or create sample data
+        if user_calendars is None:
+            # Create sample user calendars from attendees
+            attendee_emails = [input_request.get('From', '')] + [att.get('email', '') for att in input_request.get('Attendees', [])]
+            user_calendars = {email: [] for email in attendee_emails if email}
+        
+        # Call the existing scheduling function
+        result = schedule_meeting_from_request(user_calendars, meeting_request, recurrence_details)
+        
+        # Format output using the new formatter
+        return format_scheduling_output(result, input_request, recurrence_details)
+        
+    except Exception as e:
+        print(f"Error in schedule_meeting_with_json_output: {e}")
+        return {
+            "Subject": input_request.get('Subject', ''),
+            "EmailContent": input_request.get('EmailContent', ''),
+            "EventStart": None,
+            "EventEnd": None,
+            "Duration_mins": None,
+            "MetaData": {
+                "success": False,
+                "error": str(e),
+                "recurrence_details": recurrence_details or {}
+            }
         }
 
 
@@ -594,5 +871,37 @@ if __name__ == "__main__":
     }
     
     print("\n" + "="*50 + "\n")
-    schedule_meeting_from_request(USER_CALENDARS_INPUT, MEETING_REQUEST_INPUT)
+    result = schedule_meeting_from_request(USER_CALENDARS_INPUT, MEETING_REQUEST_INPUT)
     print("\n" + "="*50 + "\n")
+    
+    # Test the new JSON format functionality
+    print("\n" + "="*50 + " NEW JSON FORMAT TEST " + "="*50 + "\n")
+    
+    # Test with sample input from JSON_Samples
+    SAMPLE_JSON_INPUT = {
+        "Request_id": "6118b54f-907b-4451-8d48-dd13d76033a5",
+        "Datetime": "19-07-2025T12:34:55",
+        "Location": "IISc Bangalore",
+        "From": "userone.amd@gmail.com",
+        "Attendees": [
+            {"email": "usertwo.amd@gmail.com"},
+            {"email": "userthree.amd@gmail.com"}
+        ],
+        "Subject": "Agentic AI Project Status Update",
+        "EmailContent": "Hi team, let's meet on Thursday for 30 minutes to discuss the status of Agentic AI Project."
+    }
+    
+    # Test with recurrence details
+    RECURRENCE_DETAILS = {
+        "pattern": "weekly",
+        "frequency": 1,
+        "end_date": "2025-12-31T23:59:59+05:30"
+    }
+    
+    json_result = schedule_meeting_with_json_output(SAMPLE_JSON_INPUT, recurrence_details=RECURRENCE_DETAILS)
+    
+    import json
+    print("JSON Output:")
+    print(json.dumps(json_result, indent=2))
+    
+    print("\n" + "="*50 + " END JSON FORMAT TEST " + "="*50 + "\n")

@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 """
 Test suite for the smart meeting scheduler with enhanced features.
-Tests priority-based scheduling, participant preferences, and fallback strategies.
+Tests priority-based scheduling, participant preferences, fallback strategies, and recurrence support.
 """
 
 import unittest
 import datetime
 from main_meeting_algo import (
     schedule_meeting_from_request,
+    schedule_meeting_with_json_output,
     find_earliest_slot, 
     parse_calendar_data,
-    requirewna
+    requirewna,
+    reschedule_with_recurrence,
+    format_scheduling_output
 )
 
 
@@ -256,6 +259,136 @@ class TestSmartScheduler(unittest.TestCase):
         self.assertEqual(result['action'], 'reschedule_required')
         self.assertEqual(len(result['meetings_to_reschedule']), 1)
         self.assertIn('new_meeting', result)
+        
+    def test_recurrence_reschedule_function(self):
+        """Test recurrence-based rescheduling functionality."""
+        # Create sample meetings to reschedule
+        meetings_to_reschedule = [
+            (
+                datetime.datetime(2025, 7, 19, 9, 0).replace(tzinfo=self.tz),
+                datetime.datetime(2025, 7, 19, 10, 0).replace(tzinfo=self.tz),
+                4,
+                "Low Priority Meeting"
+            )
+        ]
+        
+        # Sample calendars
+        calendars = {
+            "user1": [],
+            "user2": []
+        }
+        
+        # Recurrence details
+        recurrence_details = {
+            "pattern": "weekly",
+            "frequency": 1,
+            "end_date": "2025-12-31T23:59:59+05:30"
+        }
+        
+        result = reschedule_with_recurrence(calendars, meetings_to_reschedule, recurrence_details)
+        
+        self.assertIsInstance(result, list)
+        self.assertEqual(len(result), 1)
+        self.assertIn('original_meeting', result[0])
+        self.assertIn('status', result[0])
+        
+    def test_json_output_format(self):
+        """Test the new JSON output formatting function."""
+        # Sample scheduling result
+        slot = (
+            datetime.datetime(2025, 7, 19, 10, 0).replace(tzinfo=self.tz),
+            datetime.datetime(2025, 7, 19, 11, 0).replace(tzinfo=self.tz)
+        )
+        
+        scheduling_result = {
+            'success': True,
+            'slot': slot,
+            'rescheduling_required': False
+        }
+        
+        meeting_request = {
+            'Subject': 'Test Meeting',
+            'EmailContent': 'This is a test meeting'
+        }
+        
+        recurrence_details = {
+            "pattern": "daily",
+            "frequency": 1
+        }
+        
+        result = format_scheduling_output(scheduling_result, meeting_request, recurrence_details)
+        
+        # Verify required fields
+        self.assertIn('Subject', result)
+        self.assertIn('EmailContent', result)
+        self.assertIn('EventStart', result)
+        self.assertIn('EventEnd', result)
+        self.assertIn('Duration_mins', result)
+        self.assertIn('MetaData', result)
+        
+        # Verify data types and values
+        self.assertEqual(result['Subject'], 'Test Meeting')
+        self.assertEqual(result['Duration_mins'], '60')
+        self.assertTrue(result['MetaData']['success'])
+        self.assertEqual(result['MetaData']['recurrence_details']['pattern'], 'daily')
+        
+    def test_schedule_meeting_with_json_output(self):
+        """Test the main JSON input/output function."""
+        # Sample JSON input from the requirements
+        json_input = {
+            "Request_id": "test-123",
+            "Datetime": "19-07-2025T12:34:55",
+            "Location": "Test Location",
+            "From": "user1@test.com",
+            "Attendees": [
+                {"email": "user2@test.com"},
+                {"email": "user3@test.com"}
+            ],
+            "Subject": "Test Meeting",
+            "EmailContent": "Let's meet for 30 minutes to discuss the project."
+        }
+        
+        # Sample recurrence details
+        recurrence_details = {
+            "pattern": "weekly",
+            "frequency": 1
+        }
+        
+        result = schedule_meeting_with_json_output(json_input, recurrence_details=recurrence_details)
+        
+        # Verify the output structure matches requirements
+        self.assertIn('Subject', result)
+        self.assertIn('EmailContent', result)
+        self.assertIn('EventStart', result)
+        self.assertIn('EventEnd', result)
+        self.assertIn('Duration_mins', result)
+        self.assertIn('MetaData', result)
+        
+        # Verify metadata contains recurrence details
+        self.assertIn('recurrence_details', result['MetaData'])
+        self.assertEqual(result['MetaData']['recurrence_details']['pattern'], 'weekly')
+        
+    def test_find_earliest_slot_with_recurrence(self):
+        """Test find_earliest_slot with recurrence parameter."""
+        calendars = {"user1": []}
+        attendees = ["user1"]
+        duration_minutes = 60
+        priority = 3
+        start_time = datetime.datetime(2025, 7, 19, 10, 0).replace(tzinfo=self.tz)
+        
+        recurrence_details = {
+            "pattern": "daily",
+            "frequency": 1
+        }
+        
+        result = find_earliest_slot(
+            calendars, attendees, duration_minutes, priority, 
+            search_start_time=start_time, recurrence_details=recurrence_details
+        )
+        
+        self.assertIsNotNone(result)
+        slot, to_reschedule = result
+        self.assertEqual(len(to_reschedule), 0)  # No conflicts expected
         
 
 if __name__ == '__main__':
